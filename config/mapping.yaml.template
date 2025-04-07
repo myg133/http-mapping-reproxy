@@ -1,0 +1,119 @@
+# Dify -> SSO 的3个端点
+"/api/oauth/token/code":
+  request:
+    target_service: sso
+    body_conversion: formtojson
+    mix_mappings: 
+    - source: 
+        !header Authorization 
+      target: 
+        !bodyfield client_id
+      action: copy
+      transformations_source:
+      - type: replace
+        from: "Bearer "
+        to: ""
+      - type: base64decode
+      - type: split
+        separator: ":"
+        index: 0
+    - source: 
+        !header Authorization 
+      target: 
+        !bodyfield client_secret
+      action: copy
+      transformations_source:
+      - type: replace
+        from: "Bearer "
+        to: ""
+      - type: base64decode
+      - type: split
+        separator: ":"
+        index: 1
+    - source: 
+        !header transfer-encoding
+      target: 
+        !header transfer-encoding
+      action: 
+        !addtarget chunked
+  response:
+    mix_mappings: 
+    - source: 
+        !header transfer-encoding
+      target: 
+        !header transfer-encoding
+      action: deletesrc
+
+"/api/oauth/account/info":
+  request:
+    target_service: sso
+    mix_mappings: 
+    - source: 
+        !header Authorization 
+      target: 
+        !header Access-Token
+      action: move
+      transformations_source:
+      - type: replace
+        from: "Bearer "
+        to: ""
+    - source: 
+        !header transfer-encoding
+      target: 
+        !header transfer-encoding
+      action: 
+        !addtarget chunked
+  response:
+    mix_mappings: 
+    - source: 
+        !header transfer-encoding
+      target: 
+        !header transfer-encoding
+      action: deletesrc
+    - source: 
+        !bodyfield data.email
+      target: 
+        !bodyfield email
+      action: copy
+
+"/login":
+  request:
+    target_service: redirect
+    mix_mappings: []
+  response:
+    mix_mappings: []
+
+"/test":
+  request:
+    target_service: sso
+    method_mapping: gettopost
+    mix_mappings: 
+    - source: 
+        !query name
+      target: 
+        !bodyfield user.name
+      action: move
+    - source: 
+        !header x-custom-age
+      target: 
+        !bodyfield age
+      action: move
+    - source: 
+        !header x-custom-sex
+      target: 
+        !query sex
+      action: move
+
+  response:
+    mix_mappings: []
+
+
+# SSO -> Dify 的回调
+"/console/api/enterprise/sso/oauth2/callback":
+  request:
+    target_service: dify
+    mix_mappings: []
+    body_conversion: formtojson
+  response:
+    mix_mappings: []
+

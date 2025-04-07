@@ -1,0 +1,25 @@
+[package]
+name = "dify-sso-adapter"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+axum = { version = "0.6", features = ["headers"] }
+tokio = { version = "1.0", features = ["full"] }
+hyper = "0.14.27"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1.0"
+serde_urlencoded = "0.7.1"
+reqwest = { version = "0.11", features = ["json"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+urlencoding = "2.1"
+anyhow = "1.0"
+config = "0.13"
+mime = "0.3"
+url = "2.4.1"
+dotenv = "0.15"
+base64 = "0.22.1"
+regex = "1.11.1"
+
