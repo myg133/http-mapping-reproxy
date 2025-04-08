@@ -1,20 +1,26 @@
 #![allow(dead_code, unused_imports)]
 use axum::{
-    body::Bytes,
-    http::{header, HeaderValue, Method, StatusCode, Uri},
+    body::{Bytes, Body},
+    http::{header, Method, StatusCode, Uri},
+    response::sse::{Event, KeepAlive, Sse},
     response::IntoResponse,
+    response::Response,
     routing::any,
     Router,
 };
 use base64::prelude::*;
 use config::{Transformation, UseMode};
+use futures_util::StreamExt;
 use reqwest::Client;
+use hyper::{header::HeaderValue, HeaderMap};
 use serde_json::{Map, Value};
 use std::{
     collections::HashMap,
+    convert::Infallible,
     net::SocketAddr,
     str::{self, FromStr},
 };
+use tokio::task::yield_now;
 use tracing::{event, Level};
 use url::form_urlencoded;
 
@@ -24,6 +30,9 @@ use crate::config::{
     ServiceType,
 };
 use ::config::{Config, Environment};
+use async_stream;
+use regex::Regex;
+use tracing_subscriber::filter::{EnvFilter, LevelFilter};
 
 async fn load_config() -> anyhow::Result<(AppConfig, HashMap<String, PathConfig>)> {
     let _ = dotenv::dotenv().ok(); // 预加载 .env
@@ -74,7 +83,7 @@ async fn load_config() -> anyhow::Result<(AppConfig, HashMap<String, PathConfig>
     Ok((app_config, path_configs))
 }
 
-fn json_to_flat_map(value: &Value, prefix: &str, result: &mut HashMap<String, String>) {
+fn json_to_flat_map(value: &Value, prefix: &str, result: &mut HashMap<String, Value>) {
     match value {
         Value::Object(obj) => {
             for (key, val) in obj {
@@ -93,52 +102,115 @@ fn json_to_flat_map(value: &Value, prefix: &str, result: &mut HashMap<String, St
             }
         }
         primitive => {
-            let str_val = match primitive {
-                Value::String(s) => s.clone(),
-                Value::Number(n) => n.to_string(),
-                Value::Bool(b) => b.to_string(),
-                Value::Null => "null".to_string(),
-                _ => "".to_string(),
-            };
-            result.insert(prefix.to_string(), str_val);
+            result.insert(prefix.to_string(), primitive.clone());
         }
     }
 }
-// map转json
-fn flat_map_to_json(map: &HashMap<String, String>) -> Value {
-    let mut root = Map::new();
 
-    for (key, value) in map {
-        let parts: Vec<&str> = key.split('.').collect();
-        insert_recursive(&mut root, &parts, value);
+/// 解析键路径，支持数组语法
+/// 示例输入："aa[0].bb[1].cc" → ["aa", "0", "bb", "1", "cc"]
+fn parse_key_path(key: &str) -> Vec<&str> {
+    let re = Regex::new(r"\[(\d+)\]|(?<index>\d+)|(?<word>\w+)").unwrap();
+    let mut parts = Vec::new();
+
+    for cap in re.captures_iter(key) {
+        if let Some(num) = cap.get(1).or(cap.name("index")) {
+            parts.push(num.as_str());
+        } else if let Some(word) = cap.name("word") {
+            parts.push(word.as_str());
+        }
     }
 
-    Value::Object(root)
+    parts
+}
+
+// map转json
+fn flat_map_to_json(map: &HashMap<String, Value>) -> Value {
+    let mut root = Value::Object(Map::new());
+
+    for (key, value) in map {
+        let parts = parse_key_path(key);
+        insert_recursive(&mut root, &parts, value.clone());
+    }
+
+    root
 }
 // 递归处理
-fn insert_recursive(current: &mut Map<String, Value>, parts: &[&str], value: &str) {
-    let (first, rest) = parts.split_first().unwrap();
+fn insert_recursive(current: &mut Value, parts: &[&str], value: Value) {
+    let (first, rest) = match parts.split_first() {
+        Some(p) => p,
+        None => return,
+    };
+    // 判断当前是否是数组索引
+    let is_array_index = first.parse::<usize>().is_ok();
 
     if rest.is_empty() {
         // 叶节点：直接插入值
-        current.insert(first.to_string(), Value::String(value.to_string()));
+        if is_array_index {
+            panic!("Cannot have array index at leaf node");
+        }
+        if current.is_object() {
+            current
+                .as_object_mut()
+                .unwrap()
+                .insert(first.to_string(), value);
+        } else {
+            let mut map = Map::new();
+            map.insert(first.to_string(), value);
+            *current = Value::Object(map);
+        }
+    } else if is_array_index {
+        // 处理数组路径
+        let index = first.parse().unwrap();
+        if !current.is_array() {
+            *current = Value::Array(Vec::new());
+        }
+        let arr = current.as_array_mut().unwrap();
+
+        // 扩展数组到所需长度
+        while arr.len() <= index {
+            arr.push(Value::Null);
+        }
+        // 初始化元素为对象（如果当前位置是Null）
+        if arr[index] == Value::Null {
+            arr[index] = Value::Object(Map::new());
+        }
+        insert_recursive(&mut arr[index], rest, value);
     } else {
+        // 确保当前是对象
+        if !current.is_object() {
+            *current = Value::Object(Map::new());
+        }
         // 中间节点：递归处理
-        let entry = current
+        let map = current.as_object_mut().unwrap();
+        // 获取或创建子节点
+        let entry = map
             .entry(first.to_string())
-            .or_insert_with(|| Value::Object(Map::new()));
+            .or_insert(Value::Object(Map::new()));
 
-        // 类型安全处理
-        let nested = match entry {
-            Value::Object(m) => m,
-            // 覆盖非对象类型
-            _ => {
-                *entry = Value::Object(Map::new());
-                entry.as_object_mut().unwrap()
+        insert_recursive(entry, rest, value);
+    }
+}
+
+/// 递归处理数组标识
+fn post_process_arrays(map: &mut Map<String, Value>) {
+    if let Some(Value::Array(arr)) = map.remove("_array") {
+        // 将当前对象替换为数组
+        *map = Map::new();
+        for (i, mut elem) in arr.into_iter().enumerate() {
+            if let Value::Object(elem_map) = &mut elem {
+                // 递归处理数组元素
+                post_process_arrays(elem_map);
             }
-        };
-
-        insert_recursive(nested, rest, value);
+            map.insert(i.to_string(), elem);
+        }
+    } else {
+        // 常规递归处理
+        for (_, v) in map.iter_mut() {
+            if let Value::Object(child) = v {
+                post_process_arrays(child);
+            }
+        }
     }
 }
 
@@ -177,9 +249,9 @@ pub fn multimap_to_query(multimap: &HashMap<String, Vec<String>>) -> String {
 }
 // json body 多级转换
 fn merge_subfields(
-    map: &HashMap<String, String>,
+    map: &HashMap<String, Value>,
     parent_key: &str,
-    pairs: &mut HashMap<String, String>,
+    pairs: &mut HashMap<String, Value>,
 ) {
     // 处理父键自身的值（单层结构）
     if let Some(value) = map.get(parent_key) {
@@ -200,7 +272,7 @@ fn merge_subfields(
 }
 // json body 多级转换为字符串
 fn json_body_to_string(
-    map: &HashMap<String, String>,
+    map: &HashMap<String, Value>,
     format: &str, // 格式模板，如 "{key}={value}"
 ) -> String {
     let mut pairs = Vec::new();
@@ -209,7 +281,9 @@ fn json_body_to_string(
         return map.values().take(1).nth(0).unwrap().to_string();
     }
     for (k, v) in map {
-        let formatted = format.replace("{key}", k).replace("{value}", v);
+        let formatted = format
+            .replace("{key}", k)
+            .replace("{value}", &v.clone().to_string().as_str());
         pairs.push(formatted);
     }
     // 按字母顺序排序保证一致性
@@ -229,7 +303,7 @@ fn get_method(config: &Option<PathConfig>, method: &Method) -> Method {
 }
 
 fn map_to_json_body(
-    res_json_map: &HashMap<String, String>,
+    res_json_map: &HashMap<String, Value>,
 ) -> Result<(Option<mime::Mime>, Vec<u8>), (StatusCode, String)> {
     let json_body = serde_json::to_vec(&flat_map_to_json(res_json_map)).map_err(|e| {
         (
@@ -241,7 +315,7 @@ fn map_to_json_body(
 }
 
 fn map_to_form_body(
-    res_json_map: &HashMap<String, String>,
+    res_json_map: &HashMap<String, Value>,
 ) -> Result<(Option<mime::Mime>, Vec<u8>), (StatusCode, String)> {
     let form_str = serde_urlencoded::to_string(res_json_map).map_err(|e| {
         (
@@ -262,7 +336,8 @@ fn apply_transformations_src(value: &str, transformations: &[Transformation]) ->
     for transform in transformations {
         match transform {
             Transformation::Base64Decode => {
-                result = base64::prelude::BASE64_STANDARD.decode(&result)
+                result = base64::prelude::BASE64_STANDARD
+                    .decode(&result)
                     .ok()
                     .and_then(|bytes| String::from_utf8(bytes).ok())
                     .unwrap_or_default();
@@ -293,7 +368,8 @@ fn apply_transformations_dst(value: &str, transformations: &[Transformation]) ->
     for transform in transformations {
         match transform {
             Transformation::Base64Decode => {
-                result = base64::prelude::BASE64_STANDARD.decode(&result)
+                result = base64::prelude::BASE64_STANDARD
+                    .decode(&result)
                     .ok()
                     .and_then(|bytes| String::from_utf8(bytes).ok())
                     .unwrap_or_default();
@@ -327,7 +403,7 @@ fn get_header_val(
     let value = match &action {
         MixAction::Move => headers_map.remove(src.as_str()),
         MixAction::Copy => headers_map.get(src.as_str()).cloned(),
-        MixAction::AddTarget(value) => Some(value.clone().parse().unwrap()),
+        MixAction::AddTarget(value) => Some(value.parse().unwrap()),
         MixAction::DeleteSrc => {
             headers_map.remove(src.as_str());
             None
@@ -377,7 +453,7 @@ async fn proxy_handler(
     method: Method,
     headers: header::HeaderMap,
     body: Bytes,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<Response, (StatusCode, String)> {
     // if method == Method::CONNECT {
     //     return handle_https_tunnel(uri, *addr).await;
     // }
@@ -422,7 +498,7 @@ async fn proxy_handler(
                     Some(config.clone()),
                     match config.request.target_service {
                         ServiceType::Dify => &app_config.dify_url,
-                        ServiceType::SSO | ServiceType::Redirect => &uri
+                        ServiceType::SSO | ServiceType::Redirect | ServiceType::SSE(_) => &uri
                             .host()
                             .ok_or((StatusCode::BAD_REQUEST, format!("Host header missing")))?
                             .to_string()
@@ -469,7 +545,7 @@ async fn proxy_handler(
                 Some(config.clone()),
                 match config.request.target_service {
                     ServiceType::Dify => &app_config.dify_url,
-                    ServiceType::SSO | ServiceType::Redirect => &app_config
+                    ServiceType::SSO | ServiceType::Redirect | ServiceType::SSE(_) => &app_config
                         .sso_url
                         .ok_or((
                             StatusCode::INTERNAL_SERVER_ERROR,
@@ -494,7 +570,7 @@ async fn proxy_handler(
     // body
     let mut json_map = HashMap::new();
     // headers
-    let mut headers_map = header::HeaderMap::new();
+    let mut headers_map = HeaderMap::new();
 
     let content_type = match method {
         Method::POST | Method::PUT => headers.get(header::CONTENT_TYPE).cloned().ok_or((
@@ -512,7 +588,7 @@ async fn proxy_handler(
         json_to_flat_map(&json_data, "", &mut json_map);
     } else if content_type == mime::APPLICATION_WWW_FORM_URLENCODED.essence_str() {
         // form
-        let form_data = serde_urlencoded::from_bytes::<HashMap<String, String>>(&body)
+        let form_data = serde_urlencoded::from_bytes::<HashMap<String, Value>>(&body)
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("Form parse error: {}", e)))?;
         json_map = form_data.clone();
     }
@@ -531,10 +607,12 @@ async fn proxy_handler(
             match (&m.source, t) {
                 // Header to Header
                 (MixSource::Header(src), MixTarget::Header(dst)) => {
-                    if let Some(mut value) = get_header_val(&mut headers_map, &m.action, src){
-                        if let Some(trans)  = trans_s.clone() {
-                            if let Some(transformed) = apply_transformations_src(&value.to_str().unwrap(),&trans){
-                                value = transformed.parse().unwrap(); 
+                    if let Some(mut value) = get_header_val(&mut headers_map, &m.action, src) {
+                        if let Some(trans) = trans_s.clone() {
+                            if let Some(transformed) =
+                                apply_transformations_src(&value.to_str().unwrap(), &trans)
+                            {
+                                value = transformed.parse().unwrap();
                             }
                         }
                         let obj = Box::leak(Box::new(dst));
@@ -543,23 +621,29 @@ async fn proxy_handler(
                 }
                 // Header to Body
                 (MixSource::Header(src), MixTarget::BodyField(dst)) => {
-                    if let Some(mut value) = get_header_val(&mut headers_map, &m.action, src){
-                        if let Some(trans)  = trans_s.clone() {
-                            if let Some(transformed) = apply_transformations_src(&value.to_str().unwrap(),&trans){
-                                value = transformed.parse().unwrap(); 
+                    if let Some(mut value) = get_header_val(&mut headers_map, &m.action, src) {
+                        if let Some(trans) = trans_s.clone() {
+                            if let Some(transformed) =
+                                apply_transformations_src(&value.to_str().unwrap(), &trans)
+                            {
+                                value = transformed.parse().unwrap();
                             }
                         }
                         let obj = Box::leak(Box::new(dst));
-                        json_map
-                            .insert(obj.to_string(), value.clone().to_str().unwrap().to_string());
+                        json_map.insert(
+                            obj.to_string(),
+                            Value::String(value.clone().to_str().unwrap().to_string()),
+                        );
                     }
                 }
                 // Header to Query
                 (MixSource::Header(src), MixTarget::Query(dst)) => {
-                    if let Some(mut value) = get_header_val(&mut headers_map, &m.action, src){
-                        if let Some(trans)  = trans_s.clone() {
-                            if let Some(transformed) = apply_transformations_src(&value.to_str().unwrap(),&trans){
-                                value = transformed.parse().unwrap(); 
+                    if let Some(mut value) = get_header_val(&mut headers_map, &m.action, src) {
+                        if let Some(trans) = trans_s.clone() {
+                            if let Some(transformed) =
+                                apply_transformations_src(&value.to_str().unwrap(), &trans)
+                            {
+                                value = transformed.parse().unwrap();
                             }
                         }
                         let obj = Box::leak(Box::new(dst));
@@ -596,13 +680,13 @@ async fn proxy_handler(
                     let value = get_querymap_val(&mut query_map, &m.action, src);
                     if let Some(value) = value {
                         let obj = Box::leak(Box::new(dst));
-                        json_map.insert(obj.to_string(), value.join(","));
+                        json_map.insert(obj.to_string(), Value::String(value.join(",")));
                     }
                 }
                 // Body to Body
                 // TODO Handle transformations
                 (MixSource::BodyField(src), MixTarget::BodyField(dst)) => {
-                    let mut res_json = HashMap::<String, String>::new();
+                    let mut res_json = HashMap::<String, Value>::new();
                     merge_subfields(&json_map, &src, &mut res_json);
                     match &m.action {
                         MixAction::Move => {
@@ -617,7 +701,7 @@ async fn proxy_handler(
                             }
                         }
                         MixAction::AddTarget(v) => {
-                            json_map.insert(src.clone(), v.clone());
+                            json_map.insert(src.clone(), Value::String(v.clone()));
                         }
                         MixAction::DeleteSrc => {
                             for (k, _) in res_json.iter() {
@@ -629,7 +713,7 @@ async fn proxy_handler(
                 // Body to Query
                 // TODO Handle transformations
                 (MixSource::BodyField(src), MixTarget::Query(dst)) => {
-                    let mut res_json = HashMap::<String, String>::new();
+                    let mut res_json = HashMap::<String, Value>::new();
                     merge_subfields(&json_map, &src, &mut res_json);
                     let value = match &m.action {
                         MixAction::Move => {
@@ -655,7 +739,7 @@ async fn proxy_handler(
                 // Body to Header
                 // TODO Handle transformations
                 (MixSource::BodyField(src), MixTarget::Header(dst)) => {
-                    let mut res_json = HashMap::<String, String>::new();
+                    let mut res_json = HashMap::<String, Value>::new();
                     merge_subfields(&json_map, &src, &mut res_json);
                     let value = match &m.action {
                         MixAction::Move => {
@@ -696,7 +780,7 @@ async fn proxy_handler(
     let c = config.clone();
 
     // redirect处理
-    let resp = match c.unwrap().request.target_service.clone() {
+    let req_red = match c.clone().unwrap().request.target_service.clone() {
         ServiceType::Redirect => {
             // 处理重定向服务的请求
             let mut h = header::HeaderMap::new();
@@ -706,12 +790,13 @@ async fn proxy_handler(
             );
             let b = Vec::<u8>::new();
             // 返回重定向响应
-            Some((StatusCode::FOUND, h, b))
+            Some((StatusCode::FOUND, h, axum::body::Bytes::from(b)))
         }
         _ => None,
     };
-    if resp.is_some() {
-        return Ok(resp.unwrap());
+
+    if req_red.is_some() {
+        return Ok(req_red.unwrap().into_response());
     }
 
     let def_json_body = (
@@ -776,6 +861,25 @@ async fn proxy_handler(
         headers_map.insert(header::HOST, to_host.parse().unwrap()); // 设置目标host
     }
 
+    // 默认更新
+    headers_map.insert(
+        header::CONTENT_LENGTH,
+        converted_body.len().to_string().parse().unwrap(),
+    );
+
+    if headers_map.contains_key(header::TRANSFER_ENCODING) {
+        let transfer_encoding = headers_map.get(header::TRANSFER_ENCODING);
+        if transfer_encoding.is_some()
+            && transfer_encoding
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("chunked")
+        {
+            headers_map.remove(header::CONTENT_LENGTH);
+        }
+    }
+
     event!(Level::DEBUG, "Request Headers: {:?}", headers_map);
 
     event!(
@@ -786,6 +890,29 @@ async fn proxy_handler(
         &headers_map,
         &converted_body.len()
     );
+
+    // sse 处理 所有前置处理完成后
+    let is_sse_req = match c.unwrap().request.target_service.clone() {
+        ServiceType::SSE(source) => {
+            // 解析配置字符串（例如 "bodyfield-stream"）
+            let (src_type, src_value) = source.split_once('-').expect("Invalid SSE source format");
+            match src_type.to_lowercase().as_str() {
+                "bodyfield" => json_map.get(src_value).and_then(|v| v.as_bool()).unwrap(),
+                "header" => headers_map
+                    .get(src_value)
+                    .and_then(|hv| hv.to_str().ok())
+                    .and_then(|s| s.parse().ok()).unwrap(),
+                "query" => query_map
+                    .get(src_value)
+                    .map(|values| Value::String(values.join(",")))
+                    .and_then(|v| v.as_bool()).unwrap(),
+                _ => false,
+            }
+        }
+        _ => false,
+    };
+
+    event!(Level::DEBUG, "is_sse_req: {:?}", is_sse_req);
 
     // 发送请求
     let client = Client::new();
@@ -807,9 +934,74 @@ async fn proxy_handler(
             )
         })?;
 
+    // headers
+    let mut res_headers_map = header::HeaderMap::new();
+
     // response mapping processing
     let res_header = response.headers().clone();
+
+    // 未匹配的，添加response header到新header
+    res_headers_map.extend(res_header.clone());
+
+    event!(Level::DEBUG, "Response Headers: {:?}", res_headers_map);
+
     let res_status = response.status();
+
+    event!(Level::DEBUG, "Response res_status: {:?}", res_status);
+
+    // sse 忽略 response 配置
+    if is_sse_req {
+        res_headers_map.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+
+        event!(Level::DEBUG, "SSE request, ignore response config");
+
+        let stream = async_stream::stream! {
+            let mut stream = response.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = match chunk {
+                        Ok(c) => c,
+                        Err(e) => {
+                            let error_msg = format!("Error: {}", e);
+                            yield Ok::<Vec<u8>, std::io::Error>(error_msg.into_bytes()); 
+                            continue;
+                        }
+                    };
+                event!(Level::DEBUG, "SSE chunk: {:?}", chunk);
+
+                yield Ok(
+                    chunk.to_vec()
+                );
+            };
+        };
+
+        return Ok((
+            res_status,
+            res_headers_map,
+            Body::from_stream(stream),
+        )
+            .into_response());
+    }
+
+    // 没有配置response mix_mappings，直接返回response
+    if config.clone().is_some() {
+        let config = config.as_ref().unwrap();
+        if config.response.mix_mappings.is_empty() {
+            event!(
+                Level::DEBUG,
+                "No need process mix, Return response directly"
+            );
+            return Ok((
+                res_status,
+                res_headers_map,
+                axum::body::Bytes::from(response.bytes().await.unwrap()),
+            )
+                .into_response());
+        }
+    }
+
     let res_body = response.bytes().await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -828,19 +1020,13 @@ async fn proxy_handler(
             .collect::<Vec<_>>(),
         res_body.len()
     );
-    
+
     let mut _rb = String::new();
     _rb = String::from_utf8(res_body.clone().to_vec()).unwrap();
     event!(Level::DEBUG, "Response origin Body: {:?}", &_rb);
 
-
     // body
     let mut res_json_map = HashMap::new();
-    // headers
-    let mut res_headers_map = header::HeaderMap::new();
-
-    // 未匹配的，添加response header到新header
-    res_headers_map.extend(res_header.clone());
 
     let res_content_type = res_headers_map.get(header::CONTENT_TYPE).cloned().ok_or((
         StatusCode::BAD_REQUEST,
@@ -848,14 +1034,22 @@ async fn proxy_handler(
     ))?;
 
     // 根据 response content-type 解析 res_body 数据
-    if res_content_type.to_str().unwrap().starts_with(mime::APPLICATION_JSON.essence_str()) {
+    if res_content_type
+        .to_str()
+        .unwrap()
+        .starts_with(mime::APPLICATION_JSON.essence_str())
+    {
         // json
         let json_data: Value = serde_json::from_slice(&res_body)
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("JSON parse error: {}", e)))?;
         json_to_flat_map(&json_data, "", &mut res_json_map);
-    } else if res_content_type.to_str().unwrap().starts_with(mime::APPLICATION_WWW_FORM_URLENCODED.essence_str()) {
+    } else if res_content_type
+        .to_str()
+        .unwrap()
+        .starts_with(mime::APPLICATION_WWW_FORM_URLENCODED.essence_str())
+    {
         // form
-        let form_data = serde_urlencoded::from_bytes::<HashMap<String, String>>(&res_body)
+        let form_data = serde_urlencoded::from_bytes::<HashMap<String, Value>>(&res_body)
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("Form parse error: {}", e)))?;
         res_json_map = form_data.clone();
     }
@@ -879,13 +1073,15 @@ async fn proxy_handler(
                     let value = get_header_val(&mut res_headers_map, &m.action, src);
                     if let Some(value) = value {
                         let obj = Box::leak(Box::new(dst));
-                        res_json_map
-                            .insert(obj.to_string(), value.clone().to_str().unwrap().to_string());
+                        res_json_map.insert(
+                            obj.to_string(),
+                            Value::String(value.clone().to_str().unwrap().to_string()),
+                        );
                     }
                 }
                 // Body to Body
                 (MixSource::BodyField(src), MixTarget::BodyField(dst)) => {
-                    let mut res_json = HashMap::<String, String>::new();
+                    let mut res_json = HashMap::<String, Value>::new();
                     merge_subfields(&res_json_map, &src, &mut res_json);
                     match &m.action {
                         MixAction::Move => {
@@ -902,7 +1098,7 @@ async fn proxy_handler(
                             }
                         }
                         MixAction::AddTarget(v) => {
-                            res_json_map.insert(src.clone(), v.clone());
+                            res_json_map.insert(src.clone(), Value::String(v.clone()));
                         }
                         MixAction::DeleteSrc => {
                             for (k, _) in res_json.iter() {
@@ -913,7 +1109,7 @@ async fn proxy_handler(
                 }
                 // Body to Header
                 (MixSource::BodyField(src), MixTarget::Header(dst)) => {
-                    let mut res_json = HashMap::<String, String>::new();
+                    let mut res_json = HashMap::<String, Value>::new();
                     merge_subfields(&res_json_map, &src, &mut res_json);
                     let value = match &m.action {
                         MixAction::Move => {
@@ -991,6 +1187,24 @@ async fn proxy_handler(
         res_headers_map.insert(header::HOST, from_host.parse().unwrap()); // 设置目标host
     }
 
+    if res_headers_map.contains_key(header::TRANSFER_ENCODING) {
+        let transfer_encoding = res_headers_map.get(header::TRANSFER_ENCODING);
+        if transfer_encoding.is_some()
+            && transfer_encoding
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("chunked")
+        {
+            res_headers_map.remove(header::CONTENT_LENGTH);
+            return Ok((
+                res_status,
+                res_headers_map,
+                axum::body::Bytes::from(res_converted_body),
+            )
+                .into_response());
+        }
+    }
     let status = res_status;
     let headers = res_headers_map;
     let body = res_converted_body.clone();
@@ -1010,22 +1224,27 @@ async fn proxy_handler(
             .iter()
             .map(|(n, v)| format!("{}={}", n, v.to_str().unwrap()))
             .collect::<Vec<_>>(),
-        body.len());
+        body.len()
+    );
 
-    Ok((status, headers, body))
+    Ok((status, headers, axum::body::Bytes::from(body)).into_response())
 }
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            EnvFilter::builder()
+                .with_default_directive(LevelFilter::INFO.into())
+                .from_env_lossy(),
+        )
         .init();
 
     let app = Router::new().fallback(any(proxy_handler));
     event!(Level::INFO, "Starting sso_adapter server on port 8080");
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
-    axum::Server::bind(&addr)
-        .serve(app.into_make_service())
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    axum::serve(listener,app.into_make_service())
         .await
         .unwrap();
 }

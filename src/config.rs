@@ -39,12 +39,13 @@ pub struct ResponseMapConfig {
     pub mix_mappings: Vec<MixMapping>,
 }
 
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum ServiceType {
     Dify,
     SSO,
     Redirect,
+    SSE(String),
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq)]
