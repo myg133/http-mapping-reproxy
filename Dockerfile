@@ -21,4 +21,4 @@ RUN apt-get update -y && apt-get install libssl3 -y && apt-get install ca-certif
 COPY --from=builder /app/target/release/dify-sso-adapter /app/
 COPY config/mapping.yaml /app/config/
 EXPOSE 8080
-CMD ["/app/dify-sso-adapter"]
+CMD ["/app/http-mapping-reproxy"]

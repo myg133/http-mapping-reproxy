@@ -1,5 +1,5 @@
 [package]
-name = "dify-sso-adapter"
+name = "http-mapping-reproxy"
 version = "0.0.1"
 edition = "2021"
 
