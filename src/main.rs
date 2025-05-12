@@ -15,10 +15,7 @@ use reqwest::Client;
 use hyper::{header::HeaderValue, HeaderMap};
 use serde_json::{Map, Value};
 use std::{
-    collections::HashMap,
-    convert::Infallible,
-    net::SocketAddr,
-    str::{self, FromStr},
+    collections::HashMap, convert::Infallible, fmt::format, net::SocketAddr, str::{self, FromStr}
 };
 use tokio::task::yield_now;
 use tracing::{event, Level};
@@ -691,6 +688,8 @@ async fn proxy_handler(
                     match &m.action {
                         MixAction::Move => {
                             for (k, v) in res_json.iter() {
+                                let src_key = format!("{}.{}",src,k);
+                                json_map.remove(src_key.as_str()); // delete source
                                 json_map.remove(k.as_str()); // delete source
                                 json_map.insert(k.clone().replace(src, dst.as_str()), v.clone());
                             }
@@ -718,6 +717,8 @@ async fn proxy_handler(
                     let value = match &m.action {
                         MixAction::Move => {
                             for (k, _) in res_json.iter() {
+                                let src_key = format!("{}.{}",src,k);
+                                json_map.remove(src_key.as_str()); // delete source
                                 json_map.remove(k.as_str());
                             }
                             Some(json_body_to_string(&res_json, "{key}={value}"))
@@ -744,6 +745,8 @@ async fn proxy_handler(
                     let value = match &m.action {
                         MixAction::Move => {
                             for (k, _) in res_json.iter() {
+                                let src_key = format!("{}.{}",src,k);
+                                json_map.remove(src_key.as_str()); // delete source
                                 json_map.remove(k.as_str());
                             }
                             Some(json_body_to_string(&res_json, "{key}={value}"))
@@ -1086,7 +1089,8 @@ async fn proxy_handler(
                     match &m.action {
                         MixAction::Move => {
                             for (k, v) in res_json.iter() {
-                                res_json_map.remove(k.as_str()); // delete source
+                                let src_key = format!("{}.{}",src,k);
+                                res_json_map.remove(src_key.as_str()); // delete source
                                 res_json_map
                                     .insert(k.clone().replace(src, dst.as_str()), v.clone());
                             }
@@ -1114,6 +1118,8 @@ async fn proxy_handler(
                     let value = match &m.action {
                         MixAction::Move => {
                             for (k, _) in res_json.iter() {
+                                let src_key = format!("{}.{}",src,k);
+                                res_json_map.remove(src_key.as_str()); // delete source
                                 res_json_map.remove(k.as_str());
                             }
                             Some(json_body_to_string(&res_json, "{key}={value}"))
@@ -1206,8 +1212,15 @@ async fn proxy_handler(
         }
     }
     let status = res_status;
-    let headers = res_headers_map;
     let body = res_converted_body.clone();
+    // 处理Body转换后的header
+    res_headers_map.remove(header::CONTENT_LENGTH);
+    res_headers_map.insert(
+        header::CONTENT_LENGTH,
+        body.len().to_string().parse().unwrap(),
+    );
+
+    let headers = res_headers_map;
 
     event!(Level::DEBUG, "Response status: {:?}", status);
     event!(Level::DEBUG, "Response headers: {:?}", headers);

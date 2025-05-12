@@ -52,7 +52,7 @@ spec:
       - name: azure-docker-secret
       containers:
       - name: adapter
-        image: aigccontainer.azurecr.cn/sso-adapter:latest
+        image: aigccontainer.azurecr.cn/sso-adapter:0.0.2
         imagePullPolicy: Always
         resources:
           # 资源

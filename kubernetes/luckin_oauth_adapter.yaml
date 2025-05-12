@@ -1,0 +1,163 @@
+kind: Secret
+apiVersion: v1
+metadata:
+  name: azure-docker-secret
+  namespace: dify-ep   # 修改部署的目标ns
+type: kubernetes.io/dockerconfigjson
+data:
+  .dockerconfigjson: eyJhdXRocyI6eyJodHRwczovL2FpZ2Njb250YWluZXIuYXp1cmVjci5jbi8iOnsidXNlcm5hbWUiOiJhaWdjY29udGFpbmVyIiwicGFzc3dvcmQiOiJyWjVoWFJ1QzVaSnhvVnJKUEFBU3U4RDJUczI0OHVoRkxETFlVdldNakMrQUNSQzcyMGlOIiwiZW1haWwiOiJtYXlnQGFuY2huZXQuY29tIiwiYXV0aCI6IllXbG5ZMk52Ym5SaGFXNWxjanB5V2pWb1dGSjFRelZhU25odlZuSktVRUZCVTNVNFJESlVjekkwT0hWb1JreEVURmxWZGxkTmFrTXJRVU5TUXpjeU1HbE8ifX19
+
+---
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sso-config-file
+  namespace: dify-ep   # 修改部署的目标ns
+data:
+  mapping.yaml: |
+    "/v2/auth/token":
+      request:
+        target_service: sso
+        body_conversion: jsontoform
+        mix_mappings:
+        - source:
+            !header Authorization
+          target:
+            !bodyfield client_id
+          action: copy
+          transformations_source:
+          - type: replace
+            from: "Bearer "
+            to: ""
+          - type: base64decode
+          - type: split
+            separator: ":"
+            index: 0
+        - source:
+            !header Authorization
+          target:
+            !bodyfield client_secret
+          action: copy
+          transformations_source:
+          - type: replace
+            from: "Bearer "
+            to: ""
+          - type: base64decode
+          - type: split
+            separator: ":"
+            index: 1
+      response:
+        mix_mappings:
+        - source:
+            !bodyfield data
+          target:
+            !bodyfield ""
+          action: move
+
+    "/v2/auth/userinfo":
+      request:
+        target_service: sso
+        body_conversion: jsontoform
+        method_mapping: gettopost
+        mix_mappings:
+        - source:
+            !header Authorization
+          target:
+            !bodyfield access_token
+          action: copy
+          transformations_source:
+          - type: replace
+            from: "Bearer "
+            to: ""
+      response:
+        mix_mappings:
+        - source:
+            !bodyfield data
+          target:
+            !bodyfield ""
+          action: move
+    "/v2/auth/sso":
+      request:
+        target_service: redirect
+        mix_mappings: []
+      response:
+        mix_mappings: []
+
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: sso-adapter
+  namespace: dify-ep  # 修改部署的目标ns
+spec:
+  selector:
+    app: sso-adapter
+  ports:
+  - protocol: TCP
+    port: 80            # 修改后需要同步修改ingress中配置
+    targetPort: 8080
+
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sso-adapter
+  namespace: dify-ep  # 修改部署的目标ns
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sso-adapter
+  template:
+    metadata:
+      labels:
+        app: sso-adapter
+    spec:
+      restartPolicy: Always
+      imagePullSecrets:
+      - name: azure-docker-secret
+      containers:
+      - name: adapter
+        image: aigccontainer.azurecr.cn/sso-adapter:latest
+        imagePullPolicy: Always
+        resources:
+          # 资源
+          requests:
+            # 请求资源
+            memory: "1Gi"
+            cpu: "0.5"
+          limits:
+            # 最大资源
+            memory: "2Gi"
+            cpu: "2.0"
+        ports:
+        - containerPort: 8080
+        env:
+        - name: RUST_LOG
+          value: "debug"
+        - name: SSO_ADAPTER_DIFY_URL
+          value: "http://console.dify.anspire.cn"  # 修改为console 的域名地址
+        - name: SSO_ADAPTER_SSO_URL
+          value: "https://authtest03.lkcoffee.com" # 域名需要修改为正式域名
+        - name: SSO_ADAPTER_CONFIG_PATH
+          value: "/app/config/mapping.yaml"
+        - name: SSO_ADAPTER_USE_MODE
+          value: "normal"
+        - name: SSO_ADAPTER_DIFY_HOST
+          value: ""
+        - name: SSO_ADAPTER_SELF_HOST
+          value: "console.dify.anspire.cn" # 修改为console 的域名地址
+        volumeMounts:
+        - name: mapping
+          mountPath: "/app/config"
+      volumes:
+      - name: mapping
+        configMap:
+          name: sso-config-file
+          items:
+          - key: "mapping.yaml"
+            path: "mapping.yaml"
