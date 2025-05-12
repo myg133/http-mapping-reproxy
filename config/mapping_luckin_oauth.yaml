@@ -1,0 +1,66 @@
+"/v2/auth/token":
+  request:
+    target_service: sso
+    body_conversion: jsontoform
+    mix_mappings:
+    - source:
+        !header Authorization
+      target:
+        !bodyfield client_id
+      action: copy
+      transformations_source:
+      - type: replace
+        from: "Bearer "
+        to: ""
+      - type: base64decode
+      - type: split
+        separator: ":"
+        index: 0
+    - source:
+        !header Authorization
+      target:
+        !bodyfield client_secret
+      action: copy
+      transformations_source:
+      - type: replace
+        from: "Bearer "
+        to: ""
+      - type: base64decode
+      - type: split
+        separator: ":"
+        index: 1
+  response:
+    mix_mappings:
+    - source:
+        !bodyfield data
+      target:
+        !bodyfield ""
+      action: move
+"/v2/auth/userinfo":
+  request:
+    target_service: sso
+    body_conversion: jsontoform
+    method_mapping: gettopost
+    mix_mappings:
+    - source:
+        !header Authorization
+      target:
+        !bodyfield access_token
+      action: copy
+      transformations_source:
+      - type: replace
+        from: "Bearer "
+        to: ""
+  response:
+    mix_mappings:
+    - source:
+        !bodyfield data
+      target:
+        !bodyfield ""
+      action: move
+"/v2/auth/sso":
+  request:
+    target_service: redirect
+    mix_mappings: []
+  response:
+    mix_mappings: []
