@@ -1,0 +1,7 @@
+"/api/chat":
+  request:
+    target_service: 
+      !sse bodyfield-stream
+    mix_mappings: []
+  response:
+    mix_mappings: []

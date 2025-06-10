@@ -1,0 +1,12 @@
+target/
+Cargo.lock
+*.log
+*.swp
+*.swo
+*.swn
+*.bak
+*.tmp
+*.DS_Store
+*.idea/
+*.vscode/
+local/

@@ -1,0 +1,27 @@
+[package]
+name = "http-mapping-reproxy"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+axum = { version = "0.8.3" }
+tokio = { version = "1.0", features = ["full"] }
+hyper = "1.6.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1.0"
+serde_urlencoded = "0.7.1"
+reqwest = { version = "0.12.5", features = ["json","stream","gzip","deflate"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+urlencoding = "2.1"
+anyhow = "1.0"
+config = "0.13"
+mime = "0.3"
+url = "2.4.1"
+dotenv = "0.15"
+base64 = "0.22.1"
+regex = "1.11.1"
+futures-util = "0.3.31"
+async-stream = "0.3.6"
+http = "1.3.1"

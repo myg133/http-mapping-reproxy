@@ -1,0 +1,101 @@
+# sse
+"/api/chat":
+  request:
+    target_service: 
+      !sse bodyfield-stream
+    mix_mappings: []
+  response:
+    mix_mappings: []
+# oauth
+"/sso/oauth/accessToken":
+  request:
+    target_service: sso
+    mix_mappings:
+    - source:
+        !header Authorization
+      target:
+        !query client_id
+      action: copy
+      transformations:
+      - type: replace
+        from: "Basic "
+        to: ""
+      - type: base64decode
+      - type: split
+        separator: ":"
+        index: 0
+    - source:
+        !header Authorization
+      target:
+        !query client_secret
+      action: copy
+      transformations:
+      - type: replace
+        from: "Basic "
+        to: ""
+      - type: base64decode
+      - type: split
+        separator: ":"
+        index: 1
+    - source:
+        !bodyfield code
+      target:
+        !query code
+      action: move
+    - source:
+        !bodyfield grant_type
+      target:
+        !query grant_type
+      action: move
+    - source:
+        !bodyfield redirect_uri
+      target:
+        !query redirect_uri
+      action: move
+  response:
+    body_conversion: formtojson
+    mix_mappings:
+    - source: !header transfer-encoding
+      target: !header transfer-encoding
+      action: deletesrc
+    - source: !header server
+      target: !header x-debug
+      action: !addtarget 1-debug
+"/sso/oauth/userInfo":
+  request:
+    target_service: sso
+    method_mapping: gettopost
+    mix_mappings:
+    - source:
+        !header Authorization
+      target:
+        !query access_token
+      action: copy
+      transformations:
+      - type: replace
+        from: "Bearer "
+        to: ""
+    - source: !header server
+      target: !header x-debug
+      action: !addtarget 1-debug
+  response:
+    body_conversion: formtojson
+    mix_mappings:
+    - source: !header transfer-encoding
+      target: !header transfer-encoding
+      action: deletesrc
+    - source: !header server
+      target: !header x-debug
+      action: !addtarget 1-debug
+"/console/api/enterprise/sso/oauth2/callback":
+  request:
+    target_service: dify
+    mix_mappings:
+    - source: !query state
+      target: !header cookie
+      action: copy
+      transformations:
+      - type: format
+        format: "user-oauth2-state="
+  response:
+    mix_mappings: []

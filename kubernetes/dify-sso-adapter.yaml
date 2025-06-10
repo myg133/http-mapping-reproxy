@@ -1,0 +1,103 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sso    # 酌情修改
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: sso-adapter
+  namespace: sso
+spec:
+  selector:
+    app: sso-adapter
+  ports:
+  - protocol: TCP
+    port: 80            # 修改后需要同步修改ingress中配置
+    targetPort: 8080    # 保持不动
+
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sso-adapter
+  namespace: sso
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sso-adapter
+  template:
+    metadata:
+      labels:
+        app: sso-adapter
+    spec:
+      restartPolicy: Always
+      containers:
+      - name: adapter
+        image: myg133/sso-adapter:latest
+        imagePullPolicy: Always
+        resources:
+          # 资源
+          requests:
+            # 请求资源
+            memory: "1Gi"
+            cpu: "0.5"
+          limits:
+            # 最新资源
+            memory: "2Gi"
+            cpu: "2.0"
+        ports:
+        - containerPort: 8080                   # 保持不动
+        env:
+        - name: RUST_LOG
+          value: "debug"
+        - name: SSO_ADAPTER_DIFY_URL
+          value: "http://admin.dify.com" # 域名需要修改
+        - name: SSO_ADAPTER_SSO_URL
+          value: "https://oauth2.xxx.com" # 域名需要修改为正式域名
+        - name: SSO_ADAPTER_CONFIG_PATH
+          value: "/app/config/mapping.yaml"   # 默认不需要调整，已按照问题修改
+        - name: SSO_ADAPTER_USE_MODE
+          value: "normal"                     # 默认不需要调整
+        - name: SSO_ADAPTER_DIFY_HOST
+          value: "admin.dify.com"      # proxy 模式行，需要修改为真实 dify 的域名，normal模式行，不使用该变量
+        - name: SSO_ADAPTER_SELF_HOST
+          value: "auth.apps.dify.com" # 当前服务对外提供的域名，不使用该变量，也是dify中配置sso中的域名
+
+---
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: sso-auth-ing
+  namespace: sso
+spec:
+  rules:
+  - host: auth.apps.dify.com  # 域名需要修改
+    http:
+      paths:
+      - backend:
+          service:
+            name: sso-adapter
+            port:
+              number: 80
+        path: /api/oauth/token/code
+        pathType: ImplementationSpecific
+      - backend:
+          service:
+            name: sso-adapter
+            port:
+              number: 80
+        path: /api/oauth/account/info
+        pathType: ImplementationSpecific
+      - backend:
+          service:
+            name: sso-adapter
+            port:
+              number: 80
+        path: /login
+        pathType: ImplementationSpecific

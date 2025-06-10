@@ -1,0 +1,3 @@
+[submodule "projs"]
+	path = projs
+	url = https://gitlab.anchnet.com/anchnet_ai/sso-configs.git
