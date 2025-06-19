@@ -44,7 +44,7 @@ pub struct ResponseMapConfig {
 pub enum ServiceType {
     Dify,
     SSO,
-    Redirect,
+    Redirect(Option<String>),
     SSE(String),
 }
 
@@ -68,11 +68,13 @@ pub struct MixMapping {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Transformation {
     Base64Decode,
+    Base64Encode,
     Split { separator: String, index: usize },
     Replace { from: String, to: String },
     Format { format: String },
     Append { value: String },
     Extract { regex: String },
+    Merge,
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]

@@ -331,7 +331,7 @@ fn map_to_form_body(
 }
 
 // 处理转换
-fn apply_transformations(value: &str, transformations: &[Transformation]) -> Option<String> {
+fn apply_transformations(transformations: &[Transformation], value: &str, dst_value: Option<&str>) -> Option<String> {
     let mut result = value.to_string();
 
     for transform in transformations {
@@ -342,6 +342,10 @@ fn apply_transformations(value: &str, transformations: &[Transformation]) -> Opt
                     .ok()
                     .and_then(|bytes| String::from_utf8(bytes).ok())
                     .unwrap_or_default();
+            }
+            Transformation::Base64Encode => {
+                result = base64::prelude::BASE64_STANDARD
+                    .encode(&result);
             }
             Transformation::Split { separator, index } => {
                 result = result
@@ -358,6 +362,11 @@ fn apply_transformations(value: &str, transformations: &[Transformation]) -> Opt
             }
             Transformation::Append { value } => {
                 result.push_str(value);
+            }
+            Transformation::Merge => {
+                if let Some(d_value) = dst_value {
+                    result.push_str(d_value)
+                }
             }
             // Test
             Transformation::Extract { regex } => {
@@ -431,6 +440,7 @@ fn get_bodymap_val(
 }
 
 async fn proxy_handler(
+    //request: axum::extract::Request,
     uri: Uri,
     method: Method,
     headers: header::HeaderMap,
@@ -439,6 +449,13 @@ async fn proxy_handler(
     // if method == Method::CONNECT {
     //     return handle_https_tunnel(uri, *addr).await;
     // }
+    
+    // event!(Level::DEBUG, "origin info {:?}",request);
+
+    // let uri: Uri = request.uri().clone();
+    // let method: Method = request.method().clone();
+    // let headers: header::HeaderMap = request.headers().clone();
+    // let body: Bytes = axum::body::to_bytes(request.into_body(),usize::MAX).await.unwrap();
 
     let (app_config, path_configs) = load_config().await.map_err(|e| {
         (
@@ -463,7 +480,7 @@ async fn proxy_handler(
         body.len()
     );
 
-    let path = uri.path();
+    let mut path = uri.path();
     let query = uri.query();
 
     event!(Level::DEBUG, "Path: {:?}", path);
@@ -478,9 +495,24 @@ async fn proxy_handler(
                 // 命中配置
                 Some(config) => (
                     Some(config.clone()),
-                    match config.request.target_service {
+                    match config.request.target_service.clone() {
                         ServiceType::Dify => &app_config.dify_url,
-                        ServiceType::SSO | ServiceType::Redirect | ServiceType::SSE(_) => &uri
+                        ServiceType::Redirect(url) => {
+                            if let Some(u) = url {
+                                path = "";
+                                &u.clone()
+                            }
+                            else {
+                                &app_config
+                                .sso_url
+                                .ok_or((
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    format!("SSO URL not configured"),
+                                ))?
+                                .clone()
+                            }
+                        }
+                        ServiceType::SSO | ServiceType::SSE(_) => &uri
                             .host()
                             .ok_or((StatusCode::BAD_REQUEST, format!("Host header missing")))?
                             .to_string()
@@ -527,7 +559,22 @@ async fn proxy_handler(
                 Some(config.clone()),
                 match config.request.target_service {
                     ServiceType::Dify => &app_config.dify_url,
-                    ServiceType::SSO | ServiceType::Redirect | ServiceType::SSE(_) => &app_config
+                    ServiceType::Redirect(url) => {
+                        if let Some(u) = url {
+                            path = "";
+                            &u.clone()
+                        }
+                        else {
+                            &app_config
+                            .sso_url
+                            .ok_or((
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("SSO URL not configured"),
+                            ))?
+                            .clone()
+                        }
+                    }
+                    ServiceType::SSO | ServiceType::SSE(_) => &app_config
                         .sso_url
                         .ok_or((
                             StatusCode::INTERNAL_SERVER_ERROR,
@@ -590,7 +637,7 @@ async fn proxy_handler(
                     if let Some(mut value) = get_header_val(&mut headers_map, &m.action, src) {
                         if let Some(trans) = trans_s.clone() {
                             if let Some(transformed) =
-                            apply_transformations(&value.to_str().unwrap(), &trans)
+                            apply_transformations(&trans, &value.to_str().unwrap(), None)
                             {
                                 value = transformed.parse().unwrap();
                             }
@@ -604,7 +651,7 @@ async fn proxy_handler(
                     if let Some(mut value) = get_header_val(&mut headers_map, &m.action, src) {
                         if let Some(trans) = trans_s.clone() {
                             if let Some(transformed) =
-                            apply_transformations(&value.to_str().unwrap(), &trans)
+                            apply_transformations(&trans,&value.to_str().unwrap(), None)
                             {
                                 value = transformed.parse().unwrap();
                             }
@@ -621,7 +668,7 @@ async fn proxy_handler(
                     if let Some(mut value) = get_header_val(&mut headers_map, &m.action, src) {
                         if let Some(trans) = trans_s.clone() {
                             if let Some(transformed) =
-                            apply_transformations(&value.to_str().unwrap(), &trans)
+                            apply_transformations(&trans, &value.to_str().unwrap(), None)
                             {
                                 value = transformed.parse().unwrap();
                             }
@@ -637,8 +684,10 @@ async fn proxy_handler(
                 (MixSource::Query(src), MixTarget::Query(dst)) => {
                     if let Some(mut value) = get_querymap_val(&mut query_map, &m.action, src){
                         if let Some(trans) = trans_s.clone() {
+                            let dst_val: Option<String> = get_querymap_val(&mut query_map, &MixAction::Copy, &dst)
+                                .map_or(None, |v| Some(v.join(",")));
                             if let Some(transformed) =
-                            apply_transformations(&value.join(",").as_str(), &trans)
+                            apply_transformations(&trans, &value.join(",").as_str(),dst_val.as_deref())
                             {
                                 let v:String = transformed.parse().unwrap();
                                 value = vec!(v.split(",").collect());
@@ -653,7 +702,7 @@ async fn proxy_handler(
                     if let Some(mut value) = get_querymap_val(&mut query_map, &m.action, src){
                         if let Some(trans) = trans_s.clone() {
                             if let Some(transformed) =
-                            apply_transformations(&value.join(",").as_str(), &trans)
+                            apply_transformations(&trans, &value.join(",").as_str(), None)
                             {
                                 let v:String = transformed.parse().unwrap();
                                 value = vec!(v.split(",").collect());
@@ -671,7 +720,7 @@ async fn proxy_handler(
                     if let Some(mut value) = get_querymap_val(&mut query_map, &m.action, src){
                         if let Some(trans) = trans_s.clone() {
                             if let Some(transformed) =
-                            apply_transformations(&value.join(",").as_str(), &trans)
+                            apply_transformations(&trans, &value.join(",").as_str(),None)
                             {
                                 let v:String = transformed.parse().unwrap();
                                 value = vec!(v.split(",").collect());
@@ -785,7 +834,7 @@ async fn proxy_handler(
 
     // redirect处理
     let req_red = match c.clone().unwrap().request.target_service.clone() {
-        ServiceType::Redirect => {
+        ServiceType::Redirect(_) => {
             // 处理重定向服务的请求
             let mut h = header::HeaderMap::new();
             h.insert(
@@ -1096,7 +1145,7 @@ async fn proxy_handler(
                     if let Some(mut value) = get_header_val(&mut res_headers_map, &m.action, src) {
                         if let Some(trans) = trans_s.clone() {
                             if let Some(transformed) =
-                            apply_transformations(&value.to_str().unwrap(), &trans)
+                            apply_transformations(&trans, &value.to_str().unwrap(),None)
                             {
                                 value = transformed.parse().unwrap();
                             }
@@ -1110,7 +1159,7 @@ async fn proxy_handler(
                     if let Some(mut value) = get_header_val(&mut res_headers_map, &m.action, src){
                         if let Some(trans) = trans_s.clone() {
                             if let Some(transformed) =
-                            apply_transformations(&value.to_str().unwrap(), &trans)
+                            apply_transformations(&trans, &value.to_str().unwrap(), None)
                             {
                                 value = transformed.parse().unwrap();
                             }
