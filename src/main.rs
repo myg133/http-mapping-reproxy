@@ -973,6 +973,8 @@ async fn proxy_handler(
 
     // 发送请求
     let client = ClientBuilder::new()
+        .danger_accept_invalid_hostnames(true)
+        .danger_accept_invalid_certs(true)
         .redirect(reqwest::redirect::Policy::none())
         .no_gzip()
         .build();
