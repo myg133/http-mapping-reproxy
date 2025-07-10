@@ -74,6 +74,7 @@ pub enum Transformation {
     Format { format: String },
     Append { value: String },
     Extract { regex: String },
+    If,
     Merge,
 }
 

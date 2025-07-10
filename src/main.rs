@@ -14,6 +14,7 @@ use futures_util::StreamExt;
 use reqwest::{Client,ClientBuilder};
 use hyper::{header::HeaderValue, HeaderMap};
 use serde_json::{Map, Value};
+use core::convert::Into;
 use std::{
     collections::HashMap, convert::Infallible, fmt::format, net::SocketAddr, str::{self, FromStr}
 };
@@ -365,7 +366,14 @@ fn apply_transformations(transformations: &[Transformation], value: &str, dst_va
             }
             Transformation::Merge => {
                 if let Some(d_value) = dst_value {
-                    result.push_str(d_value)
+                    result.push_str(d_value);
+                }
+            }
+            Transformation::If => {
+                if let Some(d_val) = dst_value {
+                    if !d_val.is_empty() {
+                        result = d_val.to_string();
+                    }
                 }
             }
             // Test
@@ -423,10 +431,10 @@ fn get_querymap_val(
 
 // 重构，获取headervalue
 fn get_bodymap_val(
-    map: &mut HashMap<String, String>,
+    map: &mut HashMap<String, Value>,
     action: &config::MixAction,
     src: &String,
-) -> Option<String> {
+) -> Option<Value> {
     let value = match &action {
         MixAction::Move => map.remove(src.as_str()),
         MixAction::Copy => map.get(src.as_str()).cloned(),
@@ -636,8 +644,10 @@ async fn proxy_handler(
                 (MixSource::Header(src), MixTarget::Header(dst)) => {
                     if let Some(mut value) = get_header_val(&mut headers_map, &m.action, src) {
                         if let Some(trans) = trans_s.clone() {
+                            let dst_val: Option<String> = get_header_val(&mut headers_map, &MixAction::Copy, &dst)
+                                .map_or(None, |v| Some(v.to_str().unwrap().to_string()));
                             if let Some(transformed) =
-                            apply_transformations(&trans, &value.to_str().unwrap(), None)
+                            apply_transformations(&trans, &value.to_str().unwrap(), dst_val.as_deref())
                             {
                                 value = transformed.parse().unwrap();
                             }
@@ -650,8 +660,10 @@ async fn proxy_handler(
                 (MixSource::Header(src), MixTarget::BodyField(dst)) => {
                     if let Some(mut value) = get_header_val(&mut headers_map, &m.action, src) {
                         if let Some(trans) = trans_s.clone() {
+                            let dst_val: Option<String> = get_bodymap_val(&mut json_map, &MixAction::Copy, &dst)
+                                .map_or(None, |v| Some(v.to_string()));
                             if let Some(transformed) =
-                            apply_transformations(&trans,&value.to_str().unwrap(), None)
+                            apply_transformations(&trans,&value.to_str().unwrap(), dst_val.as_deref())
                             {
                                 value = transformed.parse().unwrap();
                             }
@@ -667,8 +679,10 @@ async fn proxy_handler(
                 (MixSource::Header(src), MixTarget::Query(dst)) => {
                     if let Some(mut value) = get_header_val(&mut headers_map, &m.action, src) {
                         if let Some(trans) = trans_s.clone() {
+                            let dst_val: Option<String> = get_querymap_val(&mut query_map, &MixAction::Copy, &dst)
+                                .map_or(None, |v| Some(v.join(",")));
                             if let Some(transformed) =
-                            apply_transformations(&trans, &value.to_str().unwrap(), None)
+                            apply_transformations(&trans, &value.to_str().unwrap(), dst_val.as_deref())
                             {
                                 value = transformed.parse().unwrap();
                             }
@@ -701,8 +715,10 @@ async fn proxy_handler(
                 (MixSource::Query(src), MixTarget::Header(dst)) => {
                     if let Some(mut value) = get_querymap_val(&mut query_map, &m.action, src){
                         if let Some(trans) = trans_s.clone() {
+                            let dst_val: Option<String> = get_header_val(&mut headers_map, &MixAction::Copy, &dst)
+                                .map_or(None, |v| Some(v.to_str().unwrap().to_string()));
                             if let Some(transformed) =
-                            apply_transformations(&trans, &value.join(",").as_str(), None)
+                            apply_transformations(&trans, &value.join(",").as_str(), dst_val.as_deref())
                             {
                                 let v:String = transformed.parse().unwrap();
                                 value = vec!(v.split(",").collect());
@@ -719,8 +735,10 @@ async fn proxy_handler(
                 (MixSource::Query(src), MixTarget::BodyField(dst)) => {
                     if let Some(mut value) = get_querymap_val(&mut query_map, &m.action, src){
                         if let Some(trans) = trans_s.clone() {
+                            let dst_val: Option<String> = get_bodymap_val(&mut json_map, &MixAction::Copy, &dst)
+                                .map_or(None, |v| Some(v.to_string()));
                             if let Some(transformed) =
-                            apply_transformations(&trans, &value.join(",").as_str(),None)
+                            apply_transformations(&trans, &value.join(",").as_str(),dst_val.as_deref())
                             {
                                 let v:String = transformed.parse().unwrap();
                                 value = vec!(v.split(",").collect());
@@ -1135,7 +1153,7 @@ async fn proxy_handler(
         res_json_map = form_data.clone();
     }
 
-    // 处理request.mix_mappings
+    // 处理response.mix_mappings
     if let Some(conf) = &config {
         for mapping in &conf.response.mix_mappings {
             let m = mapping.clone();
@@ -1146,8 +1164,10 @@ async fn proxy_handler(
                 (MixSource::Header(src), MixTarget::Header(dst)) => {
                     if let Some(mut value) = get_header_val(&mut res_headers_map, &m.action, src) {
                         if let Some(trans) = trans_s.clone() {
+                            let dst_val: Option<String> = get_header_val(&mut res_headers_map, &MixAction::Copy, &dst)
+                                .map_or(None, |v| Some(v.to_str().unwrap().to_string()));
                             if let Some(transformed) =
-                            apply_transformations(&trans, &value.to_str().unwrap(),None)
+                            apply_transformations(&trans, &value.to_str().unwrap(),dst_val.as_deref())
                             {
                                 value = transformed.parse().unwrap();
                             }
@@ -1160,8 +1180,10 @@ async fn proxy_handler(
                 (MixSource::Header(src), MixTarget::BodyField(dst)) => {
                     if let Some(mut value) = get_header_val(&mut res_headers_map, &m.action, src){
                         if let Some(trans) = trans_s.clone() {
+                            let dst_val: Option<String> = get_bodymap_val(&mut res_json_map, &MixAction::Copy, &dst)
+                                .map_or(None, |v| Some(v.to_string()));
                             if let Some(transformed) =
-                            apply_transformations(&trans, &value.to_str().unwrap(), None)
+                            apply_transformations(&trans, &value.to_str().unwrap(), dst_val.as_deref())
                             {
                                 value = transformed.parse().unwrap();
                             }
