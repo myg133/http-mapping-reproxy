@@ -661,7 +661,7 @@ async fn proxy_handler(
                     if let Some(mut value) = get_header_val(&mut headers_map, &m.action, src) {
                         if let Some(trans) = trans_s.clone() {
                             let dst_val: Option<String> = get_bodymap_val(&mut json_map, &MixAction::Copy, &dst)
-                                .map_or(None, |v| Some(v.to_string()));
+                                .map_or(None, |v| Some(v.as_str().unwrap().to_string()));
                             if let Some(transformed) =
                             apply_transformations(&trans,&value.to_str().unwrap(), dst_val.as_deref())
                             {
@@ -736,7 +736,7 @@ async fn proxy_handler(
                     if let Some(mut value) = get_querymap_val(&mut query_map, &m.action, src){
                         if let Some(trans) = trans_s.clone() {
                             let dst_val: Option<String> = get_bodymap_val(&mut json_map, &MixAction::Copy, &dst)
-                                .map_or(None, |v| Some(v.to_string()));
+                                .map_or(None, |v| Some(v.as_str().unwrap().to_string()));
                             if let Some(transformed) =
                             apply_transformations(&trans, &value.join(",").as_str(),dst_val.as_deref())
                             {
@@ -1181,7 +1181,7 @@ async fn proxy_handler(
                     if let Some(mut value) = get_header_val(&mut res_headers_map, &m.action, src){
                         if let Some(trans) = trans_s.clone() {
                             let dst_val: Option<String> = get_bodymap_val(&mut res_json_map, &MixAction::Copy, &dst)
-                                .map_or(None, |v| Some(v.to_string()));
+                                .map_or(None, |v| Some(v.as_str().unwrap().to_string()));
                             if let Some(transformed) =
                             apply_transformations(&trans, &value.to_str().unwrap(), dst_val.as_deref())
                             {
