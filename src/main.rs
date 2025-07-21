@@ -128,6 +128,7 @@ fn flat_map_to_json(map: &HashMap<String, Value>) -> Value {
 
     for (key, value) in map {
         let parts = parse_key_path(key);
+        print!("parts: {:?}\n", parts);
         insert_recursive(&mut root, &parts, value.clone());
     }
 
@@ -139,25 +140,11 @@ fn insert_recursive(current: &mut Value, parts: &[&str], value: Value) {
         Some(p) => p,
         None => return,
     };
+    print!("first: {}\trest: {:?}\tvalue: {:?}\n", first, rest, value);
     // 判断当前是否是数组索引
     let is_array_index = first.parse::<usize>().is_ok();
 
-    if rest.is_empty() {
-        // 叶节点：直接插入值
-        if is_array_index {
-            panic!("Cannot have array index at leaf node");
-        }
-        if current.is_object() {
-            current
-                .as_object_mut()
-                .unwrap()
-                .insert(first.to_string(), value);
-        } else {
-            let mut map = Map::new();
-            map.insert(first.to_string(), value);
-            *current = Value::Object(map);
-        }
-    } else if is_array_index {
+    if is_array_index {
         // 处理数组路径
         let index = first.parse().unwrap();
         if !current.is_array() {
@@ -169,11 +156,29 @@ fn insert_recursive(current: &mut Value, parts: &[&str], value: Value) {
         while arr.len() <= index {
             arr.push(Value::Null);
         }
-        // 初始化元素为对象（如果当前位置是Null）
-        if arr[index] == Value::Null {
-            arr[index] = Value::Object(Map::new());
+        if rest.is_empty() {
+            // 叶节点：直接插入值
+            arr[index] = value;
         }
-        insert_recursive(&mut arr[index], rest, value);
+        // 初始化元素为对象（如果当前位置是Null）
+        else{
+            if arr[index] == Value::Null {
+                arr[index] = Value::Object(Map::new());
+            }
+            insert_recursive(&mut arr[index], rest, value);
+        }
+    } else if rest.is_empty() {
+        // 叶节点：直接插入值
+        if current.is_object() {
+            current
+                .as_object_mut()
+                .unwrap()
+                .insert(first.to_string(), value);
+        } else {
+            let mut map = Map::new();
+            map.insert(first.to_string(), value);
+            *current = Value::Object(map);
+        }
     } else {
         // 确保当前是对象
         if !current.is_object() {
@@ -1380,4 +1385,26 @@ async fn main() {
     axum::serve(listener,app.into_make_service())
         .await
         .unwrap();
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn json_array() {
+        let mut res_json_map = HashMap::<String,Value>::new();
+        // let john = json!({"entryUUID":"8a6287d4-7c09-ff8f-017c-0bc12adf4c90","sub":"IYANG10","role":["id=VALIDATE,id=FRANCHISE,id=appRole,ou=role,OU=Repository,o=decathlon","id=Global,id=Shoppertrak,id=appRole,ou=role,OU=Repository,o=decathlon","id=UserIT,id=Confluence,id=appRole,ou=role,OU=Repository,o=decathlon","id=COM2U_ContRev,id=COM2U,id=appRole,ou=role,OU=Repository,o=decathlon","id=StrongAuth,id=PingId,id=appRole,ou=role,ou=repository,o=decathlon","id=ACCESS,id=IPAC,id=appRole,ou=role,ou=repository,o=decathlon","id=DECASTORE_national_user,id=DECASTORE,id=appRole,ou=role,OU=Repository,o=decathlon","id=biItTools,id=OBIEE,id=appRole,ou=role,OU=Repository,o=decathlon","id=LECTURE,id=CATALOGUEAGENCEMENT,id=appRole,ou=role,ou=repository,o=decathlon","id=Admin,id=TATTOO,id=appRole,ou=role,OU=Repository,o=decathlon","id=WebApp_chiffres_secu3,id=Webapp_chiffres,id=appRole,ou=role,OU=Repository,o=decathlon","id=WebApp_chiffres_secu1,id=Webapp_chiffres,id=appRole,ou=role,OU=Repository,o=decathlon","id=CRCStoreUser,id=CRC,id=appRole,ou=role,OU=Repository,o=decathlon","id=WebApp_chiffres_secu2,id=Webapp_chiffres,id=appRole,ou=role,OU=Repository,o=decathlon","id=SportLeader,id=MyGame,id=appRole,ou=role,OU=Repository,o=decathlon","id=READER,id=POSDATA,id=appRole,ou=role,OU=Repository,o=decathlon","id=Standard,id=eTCO,id=appRole,ou=role,OU=Repository,o=decathlon","id=access,id=pds,id=appRole,ou=role,ou=repository,o=decathlon","id=User,id=Bird-Office,id=appRole,ou=role,OU=Repository,o=decathlon","id=Read,id=OptiPCB,id=appRole,ou=role,OU=Repository,o=decathlon","id=ACCESS,id=CZ_DECASPACE,id=appRole,ou=role,ou=repository,o=decathlon","id=HON,id=CZ_DECASPACE,id=appRole,ou=role,ou=repository,o=decathlon","id=SFA,id=CZ_DECASPACE,id=appRole,ou=role,ou=repository,o=decathlon","id=ADMIN,id=CZ_DECASPACE,id=appRole,ou=role,ou=repository,o=decathlon","id=ZANTHUS_PROFILE,id=ZANTHUS,id=appRole,ou=role,OU=Repository,o=decathlon","id=IT_ACCESS_DTC,id=DTC_V2,id=appRole,ou=role,OU=Repository,o=decathlon","id=access,id=sptTool,id=appRole,ou=role,ou=repository,o=decathlon","id=ROLE_SUPPORT,id=DKTRENT,id=appRole,ou=role,OU=Repository,o=decathlon","id=QC_VIEWER_ACCESS,id=QUERY_CATALOG_PORTAL,id=appRole,ou=role,OU=Repository,o=decathlon","id=SERVICES,id=WSO,id=appRole,ou=role,OU=Repository,o=decathlon","id=RCOA,id=PSV,id=appRole,ou=role,OU=Repository,o=decathlon","id=PRODUCT_DATA_INTERNATIONAL_WRITER,id=SPID,id=appRole,ou=role,OU=Repository,o=decathlon","id=PRODUCT_DATA_LOCALIZED_WRITER,id=SPID,id=appRole,ou=role,OU=Repository,o=decathlon","id=GITHUB,id=ACCESS,id=appRole,ou=role,OU=Repository,o=decathlon","id=DEFAULT,id=SPORTYCOINS,id=appRole,ou=role,OU=Repository,o=decathlon","id=VIEWER,id=CAT,id=appRole,ou=role,OU=Repository,o=decathlon"],"c":"CN","mail":"irene.yang@decathlon.com","displayName":"YANG Irene","givenName":"Irene","sex":"2","mobile":"+8617312678351","cn":"YANG Irene","sitetype":"HQ","title":"Data Engineer","objectclass":["top","person","organizationalPerson","inetOrgPerson","ocExtendedperson"],"uuid":"8a6287d4-7c09-ff8f-017c-0bc12adf4c90","allsites":"CNHQCHLB","uid":"IYANG10","site":"CNHQCHLB","federation_idp":"d1","hrid":"6101715","familyName":"YANG","sitename":"CHINA LAB","sn":"YANG","costcenter":"005010585017C105","jobname":"DATA.ENG"});
+        let john = json!({"role":["aad", {"name":"aa", "sex":"n", "dd": ["ad"]}],"t1":{"ar": 123}});
+        json_to_flat_map(&john, "",&mut res_json_map);
+        for ele in res_json_map.clone() {
+            print!("{}\n",ele.0)
+        }
+        let v = flat_map_to_json(&res_json_map);
+        println!("{:?}", v.clone());
+        println!("\n{}", v.to_string());
+        assert_eq!(1,1);
+    }
 }
