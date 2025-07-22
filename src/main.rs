@@ -128,7 +128,6 @@ fn flat_map_to_json(map: &HashMap<String, Value>) -> Value {
 
     for (key, value) in map {
         let parts = parse_key_path(key);
-        print!("parts: {:?}\n", parts);
         insert_recursive(&mut root, &parts, value.clone());
     }
 
@@ -140,7 +139,6 @@ fn insert_recursive(current: &mut Value, parts: &[&str], value: Value) {
         Some(p) => p,
         None => return,
     };
-    print!("first: {}\trest: {:?}\tvalue: {:?}\n", first, rest, value);
     // 判断当前是否是数组索引
     let is_array_index = first.parse::<usize>().is_ok();
 
