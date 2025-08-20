@@ -386,6 +386,12 @@ fn apply_transformations(transformations: &[Transformation], value: &str, dst_va
                 .map(|mat| mat.as_str().to_string())
                 .unwrap_or_else(|| result);
             }
+            Transformation::Lowercase => {
+                result = result.to_lowercase();
+            }
+            Transformation::Uppercase => {
+                result = result.to_uppercase();
+            }
         }
 
         if result.is_empty() {

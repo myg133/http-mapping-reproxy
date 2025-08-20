@@ -76,6 +76,8 @@ pub enum Transformation {
     Extract { regex: String },
     If,
     Merge,
+    Lowercase,
+    Uppercase,
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]
