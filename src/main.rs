@@ -1,4 +1,6 @@
 #![allow(dead_code, unused_imports)]
+mod cache;
+
 use axum::{
     body::{Bytes, Body},
     http::{header, Method, StatusCode, Uri},
@@ -9,10 +11,12 @@ use axum::{
     Router,
 };
 use base64::prelude::*;
+use cache::{create_shared_cache, SharedCache};
 use config::{Transformation, UseMode};
 use futures_util::StreamExt;
 use reqwest::{Client,ClientBuilder};
 use hyper::{header::HeaderValue, HeaderMap};
+use once_cell::sync::Lazy;
 use serde_json::{Map, Value};
 use core::convert::Into;
 use std::{
@@ -31,6 +35,18 @@ use ::config::{Config, Environment};
 use async_stream;
 use regex::Regex;
 use tracing_subscriber::filter::{EnvFilter, LevelFilter};
+
+// 全局用户信息缓存
+static USER_CACHE: Lazy<SharedCache> = Lazy::new(create_shared_cache);
+
+/// 替换配置内容中的 `${VAR}` 环境变量占位符
+fn substitute_env_vars(content: &str) -> String {
+    let re = Regex::new(r"\$\{([^}]+)\}").unwrap();
+    re.replace_all(content, |caps: &regex::Captures| {
+        let var_name = &caps[1];
+        std::env::var(var_name).unwrap_or_else(|_| caps[0].to_string())
+    }).to_string()
+}
 
 async fn load_config() -> anyhow::Result<(AppConfig, HashMap<String, PathConfig>)> {
     let _ = dotenv::dotenv().ok(); // 预加载 .env
@@ -66,6 +82,7 @@ async fn load_config() -> anyhow::Result<(AppConfig, HashMap<String, PathConfig>
     } // 根据 use_mode 加载不同的配置逻辑
 
     let config_content = std::fs::read_to_string(&app_config.config_path)?;
+    let config_content = substitute_env_vars(&config_content);
     let path_configs: HashMap<String, PathConfig> = serde_yaml::from_str(&config_content)
         .map_err(|e| {
             event!(Level::ERROR, "Failed to parse config file: {}", e);
@@ -248,6 +265,22 @@ pub fn multimap_to_query(multimap: &HashMap<String, Vec<String>>) -> String {
         )
         .finish()
 }
+// 将 query_map 按 key 排序并拼接为 key=value&key2=value2 格式
+fn query_map_to_sorted_string(query_map: &HashMap<String, Vec<String>>) -> String {
+    let mut keys: Vec<&String> = query_map.keys().collect();
+    keys.sort();
+    
+    let mut parts = Vec::new();
+    for key in keys {
+        if let Some(values) = query_map.get(key) {
+            for value in values {
+                parts.push(format!("{}={}", key, value));
+            }
+        }
+    }
+    parts.join("&")
+}
+
 // json body 多级转换
 fn merge_subfields(
     map: &HashMap<String, Value>,
@@ -335,8 +368,40 @@ fn map_to_form_body(
 }
 
 // 处理转换
-fn apply_transformations(transformations: &[Transformation], value: &str, dst_value: Option<&str>) -> Option<String> {
+async fn apply_transformations(
+        transformations: &[Transformation],
+        value: &str,
+        dst_value: Option<&str>,
+        query_map: Option<&std::collections::HashMap<String, Vec<String>>>
+    ) -> Option<String> {
     let mut result = value.to_string();
+
+    // 占位符替换的辅助函数
+    let replace_placeholders = |s: &str, current_result: &str| -> String {
+        let mut res = s.to_string();
+        event!(Level::DEBUG, "[replace_placeholders] input: {}", res);
+        // 替换 {input}
+        res = res.replace("{input}", current_result);
+        event!(Level::DEBUG, "[replace_placeholders] after {{input}}: {}", res);
+        // 替换 {query:key}
+        if let Some(qm) = query_map {
+            event!(Level::DEBUG, "[replace_placeholders] query_map keys: {:?}", qm.keys().collect::<Vec<_>>());
+            for (key, vals) in qm.iter() {
+                if let Some(v) = vals.first() {
+                    let pattern = format!("{{query:{}}}", key);
+                    event!(Level::DEBUG, "[replace_placeholders] trying to replace: {} -> {}", pattern, v);
+                    res = res.replace(&pattern, v);
+                }
+            }
+        }
+        event!(Level::DEBUG, "[replace_placeholders] after query: {}", res);
+        // 替换 ${VAR} 环境变量
+        for key_val in std::env::vars() {
+            res = res.replace(&format!("${{{}}}", key_val.0), &key_val.1);
+        }
+        event!(Level::DEBUG, "[replace_placeholders] final: {}", res);
+        res
+    };
 
     for transform in transformations {
         match transform {
@@ -392,6 +457,120 @@ fn apply_transformations(transformations: &[Transformation], value: &str, dst_va
             Transformation::Uppercase => {
                 result = result.to_uppercase();
             }
+            Transformation::HttpRequest { url, method, body, headers, query_params, response_field } => {
+                event!(Level::DEBUG, ">>> HttpRequest transformation start");
+                let client = reqwest::Client::new();
+                let http_method = method.as_deref().unwrap_or("POST");
+                event!(Level::DEBUG, "    method: {}", http_method);
+                
+                // 处理 URL 占位符替换
+                let processed_url = replace_placeholders(url, &result);
+                event!(Level::DEBUG, "    url: {} -> {}", url, processed_url);
+                
+                let mut request_builder = match http_method.to_uppercase().as_str() {
+                    "GET" => client.get(processed_url),
+                    "POST" => client.post(processed_url),
+                    "PUT" => client.put(processed_url),
+                    "DELETE" => client.delete(processed_url),
+                    _ => {
+                        event!(Level::ERROR, "Unsupported HTTP method: {}", http_method);
+                        return None;
+                    }
+                };
+                
+                // 添加 headers
+                if let Some(header_map) = headers {
+                    for (key, val) in header_map {
+                        let processed_val = replace_placeholders(val, &result);
+                        event!(Level::DEBUG, "    header: {} -> {}", key, processed_val);
+                        if let Ok(header_val) = reqwest::header::HeaderValue::from_str(&processed_val) {
+                            request_builder = request_builder.header(key, header_val);
+                        }
+                    }
+                }
+                
+                // 添加 query params
+                if let Some(query_map) = query_params {
+                    for (key, val) in query_map {
+                        let processed_val = replace_placeholders(val, &result);
+                        event!(Level::DEBUG, "    query: {} -> {}", key, processed_val);
+                        request_builder = request_builder.query(&[(key, processed_val)]);
+                    }
+                }
+                
+                // 如果有 body，设置请求体
+                if let Some(body_content) = body {
+                    let processed_body = replace_placeholders(body_content, &result);
+                    event!(Level::DEBUG, "    body: {} -> {}", body_content, processed_body);
+                    request_builder = request_builder.body(processed_body);
+                } else {
+                    event!(Level::DEBUG, "    body (no config): {}", result);
+                    request_builder = request_builder.body(result.clone());
+                }
+                
+                // 构建请求并打印完整 URL
+                if let Some(cloned) = request_builder.try_clone() {
+                    match cloned.build() {
+                        Ok(req) => {
+                            event!(Level::DEBUG, "<<< HttpRequest complete URL: {}", req.url());
+                        }
+                        Err(e) => {
+                            event!(Level::WARN, "<<< HttpRequest failed to build: {:?}", e);
+                        }
+                    }
+                } else {
+                    event!(Level::WARN, "<<< HttpRequest failed to clone builder for URL logging");
+                }
+                
+                // 发送请求并获取响应
+                event!(Level::DEBUG, "<<< HttpRequest sending...");
+                match request_builder.send().await {
+                    Ok(response) => {
+                        event!(Level::DEBUG, "    response status: {}", response.status());
+                        match response.text().await {
+                            Ok(text) => {
+                                event!(Level::DEBUG, "    response body: {}", text);
+                                
+                                // 如果配置了 response_field，则从 JSON 中提取该字段
+                                if let Some(field) = response_field {
+                                    event!(Level::DEBUG, "    Extracting field: {}", field);
+                                    match serde_json::from_str::<serde_json::Value>(&text) {
+                                        Ok(json) => {
+                                            if let Some(value) = json.get(field) {
+                                                if let Some(str_value) = value.as_str() {
+                                                    result = str_value.to_string();
+                                                    event!(Level::DEBUG, "    Extracted value: {}", result);
+                                                } else {
+                                                    // 如果不是字符串，直接转为字符串
+                                                    result = value.to_string();
+                                                    event!(Level::DEBUG, "    Extracted non-string value: {}", result);
+                                                }
+                                            } else {
+                                                event!(Level::WARN, "    Field '{}' not found in response", field);
+                                                result = text;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            event!(Level::WARN, "    Failed to parse response as JSON: {:?}", e);
+                                            result = text;
+                                        }
+                                    }
+                                } else {
+                                    result = text;
+                                }
+                            }
+                            Err(e) => {
+                                event!(Level::ERROR, "Failed to read HTTP response: {:?}", e);
+                                return None;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        event!(Level::ERROR, "HTTP request failed: {:?}", e);
+                        return None;
+                    }
+                }
+            }
         }
 
         if result.is_empty() {
@@ -416,11 +595,13 @@ fn get_header_val(
             headers_map.remove(src.as_str());
             None
         }
+        // CacheSet/CacheGet 不在 header 级别处理
+        MixAction::CacheSet | MixAction::CacheGet => None,
     };
     value
 }
 
-// 重构，获取headervalue
+// 重构，获取querymap value
 fn get_querymap_val(
     map: &mut HashMap<String, Vec<String>>,
     action: &config::MixAction,
@@ -434,11 +615,13 @@ fn get_querymap_val(
             map.remove(src.as_str());
             None
         }
+        // CacheSet/CacheGet 不在 query 级别处理
+        MixAction::CacheSet | MixAction::CacheGet => None,
     };
     value
 }
 
-// 重构，获取headervalue
+// 重构，获取bodymap value
 fn get_bodymap_val(
     map: &mut HashMap<String, Value>,
     action: &config::MixAction,
@@ -452,6 +635,8 @@ fn get_bodymap_val(
             map.remove(src.as_str());
             None
         }
+        // CacheSet/CacheGet 不在 body 级别处理
+        MixAction::CacheSet | MixAction::CacheGet => None,
     };
     value
 }
@@ -485,11 +670,10 @@ async fn proxy_handler(
     event!(Level::INFO, "Use mode: {:?}", use_mode);
 
     // 记录请求基本信息
+    event!(Level::INFO, "Received {} request to {}", method, uri);
     event!(
-        Level::INFO,
-        "Received {} request to {} | Headers: {:?} | Body size: {} bytes",
-        method,
-        uri,
+        Level::DEBUG,
+        "Request headers: {:?} | Body size: {} bytes",
         headers
             .iter()
             .map(|(n, v)| format!("{}={}", n, v.to_str().unwrap()))
@@ -529,7 +713,7 @@ async fn proxy_handler(
                                 .clone()
                             }
                         }
-                        ServiceType::SSO | ServiceType::SSE(_) => &uri
+                        ServiceType::SSO | ServiceType::SSE(_) | ServiceType::DirectResponse => &uri
                             .host()
                             .ok_or((StatusCode::BAD_REQUEST, format!("Host header missing")))?
                             .to_string()
@@ -591,7 +775,7 @@ async fn proxy_handler(
                             .clone()
                         }
                     }
-                    ServiceType::SSO | ServiceType::SSE(_) => &app_config
+                    ServiceType::SSO | ServiceType::SSE(_) | ServiceType::DirectResponse => &app_config
                         .sso_url
                         .ok_or((
                             StatusCode::INTERNAL_SERVER_ERROR,
@@ -603,12 +787,10 @@ async fn proxy_handler(
         }
     };
 
-    event!(Level::DEBUG, "matched config: {:?}", &config);
-
     // method转换
     let target_method = get_method(&config, &method);
 
-    // query
+    // query - 必须提前构建，因为 CacheGet 需要用到
     let mut query_map = match query {
         Some(query) => query_to_multimap(&query),
         None => HashMap::new(),
@@ -617,6 +799,10 @@ async fn proxy_handler(
     let mut json_map = HashMap::new();
     // headers
     let mut headers_map = HeaderMap::new();
+    
+    // 保存原始 request 的 headers 和 query，供 response mix mappings 使用
+    let req_headers = headers.clone();
+    let req_query = query.map(|q| q.to_string()).unwrap_or_default();
 
     let content_type = match method {
         Method::POST | Method::PUT => headers.get(header::CONTENT_TYPE).cloned().ok_or((
@@ -626,6 +812,9 @@ async fn proxy_handler(
         _ => HeaderValue::from_str("").unwrap(),
     };
 
+    // 打印原始 body 内容
+    event!(Level::DEBUG, "Raw request body: {}", String::from_utf8_lossy(&body));
+    
     // 根据 content-type 解析 body 数据
     if content_type == mime::APPLICATION_JSON.essence_str() {
         // json
@@ -638,17 +827,34 @@ async fn proxy_handler(
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("Form parse error: {}", e)))?;
         json_map = form_data.clone();
     }
+    
+    // 打印解析后的 body map
+    event!(Level::DEBUG, "Parsed json_map: {:?}", json_map);
+
+    event!(Level::DEBUG, "matched config: {:?}", &config);
 
     // 未匹配的，添加源header到新header
     headers_map.extend(headers.clone());
 
     // 处理request.mix_mappings
     if let Some(conf) = &config {
-        for mapping in &conf.request.mix_mappings {
+        event!(Level::DEBUG, ">>> Starting mix mappings, query_map keys: {:?}", query_map.keys().collect::<Vec<_>>());
+        for (idx, mapping) in conf.request.mix_mappings.iter().enumerate() {
             let m = mapping.clone();
+            let s = m.source.clone();
             let t = m.target.clone();
             let trans_s = m.transformations.clone();
-            match (&m.source, t) {
+            event!(Level::DEBUG, ">>> mix mapping {}", idx);
+            if s.is_none() || t.is_none() {
+                continue;
+            }
+            let s = s.unwrap();
+            let t = t.unwrap();
+            match (&s, t) {
+                // ReqQuery 和 ReqHeader 只在 response mix mappings 中使用
+                (MixSource::ReqQuery(_), _) | (MixSource::ReqHeader(_), _) => {
+                    event!(Level::WARN, "ReqQuery/ReqHeader only supported in response mix_mappings, ignoring");
+                }
                 // Header to Header
                 (MixSource::Header(src), MixTarget::Header(dst)) => {
                     if let Some(mut value) = get_header_val(&mut headers_map, &m.action, src) {
@@ -656,7 +862,7 @@ async fn proxy_handler(
                             let dst_val: Option<String> = get_header_val(&mut headers_map, &MixAction::Copy, &dst)
                                 .map_or(None, |v| Some(v.to_str().unwrap().to_string()));
                             if let Some(transformed) =
-                            apply_transformations(&trans, &value.to_str().unwrap(), dst_val.as_deref())
+                            apply_transformations(&trans, &value.to_str().unwrap(), dst_val.as_deref(), Some(&query_map)).await
                             {
                                 value = transformed.parse().unwrap();
                             }
@@ -672,7 +878,7 @@ async fn proxy_handler(
                             let dst_val: Option<String> = get_bodymap_val(&mut json_map, &MixAction::Copy, &dst)
                                 .map_or(None, |v| Some(v.as_str().unwrap().to_string()));
                             if let Some(transformed) =
-                            apply_transformations(&trans,&value.to_str().unwrap(), dst_val.as_deref())
+                            apply_transformations(&trans,&value.to_str().unwrap(), dst_val.as_deref(), Some(&query_map)).await
                             {
                                 value = transformed.parse().unwrap();
                             }
@@ -686,17 +892,23 @@ async fn proxy_handler(
                 }
                 // Header to Query
                 (MixSource::Header(src), MixTarget::Query(dst)) => {
-                    if let Some(mut value) = get_header_val(&mut headers_map, &m.action, src) {
+                    event!(Level::DEBUG, ">>> Header to Query: {} -> {}", src, dst);
+                    let value_opt = get_header_val(&mut headers_map, &m.action, src);
+                    event!(Level::DEBUG, ">>> get_header_val returned: {:?}", value_opt);
+                    if let Some(mut value) = value_opt {
+                        event!(Level::DEBUG, ">>> value before trans: {}", value.to_str().unwrap_or_default());
                         if let Some(trans) = trans_s.clone() {
                             let dst_val: Option<String> = get_querymap_val(&mut query_map, &MixAction::Copy, &dst)
                                 .map_or(None, |v| Some(v.join(",")));
                             if let Some(transformed) =
-                            apply_transformations(&trans, &value.to_str().unwrap(), dst_val.as_deref())
+                            apply_transformations(&trans, &value.to_str().unwrap(), dst_val.as_deref(), Some(&query_map)).await
                             {
                                 value = transformed.parse().unwrap();
+                                event!(Level::DEBUG, ">>> value after trans: {}", value.to_str().unwrap_or_default());
                             }
                         }
                         let obj = Box::leak(Box::new(dst));
+                        event!(Level::DEBUG, ">>> inserting into query_map: {} -> {}", obj.to_string(), value.to_str().unwrap_or_default());
                         query_map.insert(
                             obj.to_string(),
                             vec![value.clone().to_str().unwrap().to_string()],
@@ -705,18 +917,31 @@ async fn proxy_handler(
                 }
                 // Quert to Query
                 (MixSource::Query(src), MixTarget::Query(dst)) => {
-                    if let Some(mut value) = get_querymap_val(&mut query_map, &m.action, src){
+                    event!(Level::DEBUG, ">>> Query to Query: {} -> {}", src, dst);
+                    let value_opt = match &m.action {
+                        MixAction::AddTarget(value) => {
+                            // AddTarget 直接使用指定的值，不依赖 source
+                            event!(Level::DEBUG, ">>> AddTarget with value: {}", value);
+                            Some(vec![value.clone()])
+                        },
+                        _ => get_querymap_val(&mut query_map, &m.action, src)
+                    };
+                    event!(Level::DEBUG, ">>> value_opt resolved to: {:?}", value_opt);
+                    if let Some(mut value) = value_opt {
+                        event!(Level::DEBUG, ">>> value before trans: {}", value.join(","));
                         if let Some(trans) = trans_s.clone() {
                             let dst_val: Option<String> = get_querymap_val(&mut query_map, &MixAction::Copy, &dst)
                                 .map_or(None, |v| Some(v.join(",")));
                             if let Some(transformed) =
-                            apply_transformations(&trans, &value.join(",").as_str(),dst_val.as_deref())
+                            apply_transformations(&trans, &value.join(",").as_str(),dst_val.as_deref(), Some(&query_map)).await
                             {
                                 let v:String = transformed.parse().unwrap();
                                 value = vec!(v.split(",").collect());
+                                event!(Level::DEBUG, ">>> value after trans: {}", value.join(","));
                             }
                         }
                         let obj = Box::leak(Box::new(dst));
+                        event!(Level::DEBUG, ">>> inserting into query_map: {} -> {}", obj.to_string(), value.join(","));
                         query_map.insert(obj.to_string(), value);
                     }
                 }
@@ -727,7 +952,7 @@ async fn proxy_handler(
                             let dst_val: Option<String> = get_header_val(&mut headers_map, &MixAction::Copy, &dst)
                                 .map_or(None, |v| Some(v.to_str().unwrap().to_string()));
                             if let Some(transformed) =
-                            apply_transformations(&trans, &value.join(",").as_str(), dst_val.as_deref())
+                            apply_transformations(&trans, &value.join(",").as_str(), dst_val.as_deref(), Some(&query_map)).await
                             {
                                 let v:String = transformed.parse().unwrap();
                                 value = vec!(v.split(",").collect());
@@ -740,6 +965,25 @@ async fn proxy_handler(
                         );
                     }
                 }
+                // AllQueries to Header - 将所有 query 参数排序拼接
+                (MixSource::AllQueries, MixTarget::Header(dst)) => {
+                    let query_str = query_map_to_sorted_string(&query_map);
+                    let mut value = query_str.clone();
+                    if let Some(trans) = trans_s.clone() {
+                        let dst_val: Option<String> = get_header_val(&mut headers_map, &MixAction::Copy, &dst)
+                            .map_or(None, |v| Some(v.to_str().unwrap().to_string()));
+                        if let Some(transformed) =
+                        apply_transformations(&trans, &query_str, dst_val.as_deref(), Some(&query_map)).await
+                        {
+                            value = transformed;
+                        }
+                    }
+                    let obj = Box::leak(Box::new(dst));
+                    headers_map.insert(
+                        obj.as_str(),
+                        HeaderValue::from_str(value.as_str()).unwrap(),
+                    );
+                }
                 // Query to Body
                 (MixSource::Query(src), MixTarget::BodyField(dst)) => {
                     if let Some(mut value) = get_querymap_val(&mut query_map, &m.action, src){
@@ -747,7 +991,7 @@ async fn proxy_handler(
                             let dst_val: Option<String> = get_bodymap_val(&mut json_map, &MixAction::Copy, &dst)
                                 .map_or(None, |v| Some(v.as_str().unwrap().to_string()));
                             if let Some(transformed) =
-                            apply_transformations(&trans, &value.join(",").as_str(),dst_val.as_deref())
+                            apply_transformations(&trans, &value.join(",").as_str(),dst_val.as_deref(), Some(&query_map)).await
                             {
                                 let v:String = transformed.parse().unwrap();
                                 value = vec!(v.split(",").collect());
@@ -784,6 +1028,8 @@ async fn proxy_handler(
                                 json_map.remove(k.as_str()); // delete source
                             }
                         }
+                        // CacheSet/CacheGet 不在 request body->body 处理
+                        MixAction::CacheSet | MixAction::CacheGet => {}
                     };
                 }
                 // Body to Query
@@ -808,11 +1054,18 @@ async fn proxy_handler(
                             }
                             None
                         }
+                        // CacheSet/CacheGet 不在 request body->query 处理
+                        MixAction::CacheSet | MixAction::CacheGet => None,
                     };
                     if let Some(value) = value {
                         let obj = Box::leak(Box::new(dst));
                         query_map.insert(obj.to_string(), vec![value]);
                     }
+                }
+                // AllQueries to Query/Body - 不支持
+                (MixSource::AllQueries, MixTarget::Query(_)) |
+                (MixSource::AllQueries, MixTarget::BodyField(_)) => {
+                    event!(Level::WARN, "AllQueries source only supports Header target");
                 }
                 // Body to Header
                 // TODO Handle transformations
@@ -836,6 +1089,8 @@ async fn proxy_handler(
                             }
                             None
                         }
+                        // CacheSet/CacheGet 不在 request body->header 处理
+                        MixAction::CacheSet | MixAction::CacheGet => None,
                     };
                     if let Some(value) = value {
                         let obj = Box::leak(Box::new(dst));
@@ -844,9 +1099,11 @@ async fn proxy_handler(
                     }
                 }
             }
+            event!(Level::DEBUG, "<<< mix mapping {}, query_map keys: {:?}", idx, query_map.keys().collect::<Vec<_>>());
         }
     }
 
+    event!(Level::DEBUG, "All mix mappings done, query_map keys: {:?}", query_map.keys().collect::<Vec<_>>());
     event!(Level::DEBUG, "final body : {:?}", json_map);
 
     // 目标地址处理 + query参数
@@ -879,19 +1136,32 @@ async fn proxy_handler(
         return Ok(req_red.unwrap().into_response());
     }
 
-    let def_json_body = (
-        headers
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.parse().unwrap()),
-        body.to_vec(),
-    );
+    // 如果是 GET 请求，清空 json_map 来避免发送 body
+    let mut final_json_map = json_map.clone();
+    if target_method == Method::GET {
+        final_json_map.clear();
+    }
+
+    // 如果是 GET 请求，强制使用空 body
+    let (def_content_type, def_body) = if target_method == Method::GET {
+        (None, Vec::new())
+    } else {
+        (
+            headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.parse().unwrap()),
+            body.to_vec(),
+        )
+    };
+    let def_json_body = (def_content_type, def_body);
+
     // 生成真实请求body
     let (content_type, converted_body) = match &config {
         Some(config) => match config.request.body_conversion {
-            Some(BodyConversion::FormToJson) => map_to_json_body(&json_map)?,
+            Some(BodyConversion::FormToJson) => map_to_json_body(&final_json_map)?,
             Some(BodyConversion::JsonToForm) => {
-                let form_str = serde_urlencoded::to_string(&json_map).map_err(|e| {
+                let form_str = serde_urlencoded::to_string(&final_json_map).map_err(|e| {
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         format!("Form conversion error: {}", e),
@@ -903,16 +1173,16 @@ async fn proxy_handler(
                 )
             }
             None => {
-                if !json_map.is_empty() {
-                    map_to_json_body(&json_map)?
+                if !final_json_map.is_empty() {
+                    map_to_json_body(&final_json_map)?
                 } else {
                     def_json_body
                 }
             }
         },
         None => {
-            if !json_map.is_empty() {
-                map_to_json_body(&json_map)?
+            if !final_json_map.is_empty() {
+                map_to_json_body(&final_json_map)?
             } else {
                 def_json_body
             }
@@ -933,6 +1203,18 @@ async fn proxy_handler(
         );
     }
 
+    // 如果是 GET 请求，移除 Content-Type 和 Content-Length
+    if target_method == Method::GET {
+        headers_map.remove(header::CONTENT_TYPE);
+        headers_map.remove(header::CONTENT_LENGTH);
+    } else {
+        // 非 GET 请求，才设置 Content-Length
+        headers_map.insert(
+            header::CONTENT_LENGTH,
+            converted_body.len().to_string().parse().unwrap(),
+        );
+    }
+
     // 请求模式需要修改 host头
     if use_mode == UseMode::Normal {
         let to_host = Uri::from_str(base_url).unwrap().host().unwrap().to_string();
@@ -940,12 +1222,6 @@ async fn proxy_handler(
         headers_map.remove(header::HOST);
         headers_map.insert(header::HOST, to_host.parse().unwrap()); // 设置目标host
     }
-
-    // 默认更新
-    headers_map.insert(
-        header::CONTENT_LENGTH,
-        converted_body.len().to_string().parse().unwrap(),
-    );
 
     if headers_map.contains_key(header::TRANSFER_ENCODING) {
         let transfer_encoding = headers_map.get(header::TRANSFER_ENCODING);
@@ -964,19 +1240,16 @@ async fn proxy_handler(
     if headers_map.contains_key(header::ACCEPT_ENCODING){
         headers_map.remove(header::ACCEPT_ENCODING);
     }
-    event!(Level::DEBUG, "Request Headers: {:?}", headers_map);
-
+    event!(Level::INFO, "Sending {} request to {}", &target_method, &target_url);
     event!(
-        Level::INFO,
-        "Sending {} request to {} with Headers: {:?} and Body size: {}",
-        &target_method,
-        &target_url,
+        Level::DEBUG,
+        "Request headers: {:?} | Body size: {}",
         &headers_map,
         &converted_body.len()
     );
 
     // sse 处理 所有前置处理完成后
-    let is_sse_req = match c.unwrap().request.target_service.clone() {
+    let is_sse_req = match c.as_ref().unwrap().request.target_service.clone() {
         ServiceType::SSE(source) => {
             // 解析配置字符串（例如 "bodyfield-stream"）
             let (src_type, src_value) = source.split_once('-').expect("Invalid SSE source format");
@@ -998,58 +1271,127 @@ async fn proxy_handler(
 
     event!(Level::DEBUG, "is_sse_req: {:?}", is_sse_req);
 
-    // 发送请求
-    let client = ClientBuilder::new()
-        .danger_accept_invalid_hostnames(true)
-        .danger_accept_invalid_certs(true)
-        .redirect(reqwest::redirect::Policy::none())
-        .no_gzip()
-        .build();
+    // 检查是否是 DirectResponse 类型请求（跳过真实请求，直接进入 response 流程）
+    let is_direct_response = match c.as_ref().unwrap().request.target_service.clone() {
+        ServiceType::DirectResponse => true,
+        _ => false,
+    };
+    
+    event!(Level::DEBUG, "is_direct_response: {:?}", is_direct_response);
 
+    // 尝试从缓存获取数据（如果配置了 CacheGet）
+    let cache_config = if is_direct_response {
+        // 从 response mix_mappings 中找 CacheGet action 的配置
+        let mut cache_key: Option<String> = None;
+        if let Some(conf) = &c {
+            for m in &conf.response.mix_mappings {
+                if let MixAction::CacheGet = &m.action {
+                    if let Some(key_field) = &m.cache_key_field {
+                        event!(Level::DEBUG, ">>> CacheGet looking for key_field: {}", key_field);
+                        // 尝试从 query_map 中获取 key（经过 request mix mappings 处理后的）
+                        cache_key = query_map.get(key_field)
+                            .and_then(|v| v.first()).map(|s| s.clone());
+                        if cache_key.is_none() {
+                            // 尝试从 header 中获取 key
+                            cache_key = headers.get(key_field.as_str())
+                                .and_then(|v| v.to_str().ok())
+                                .map(|s| s.to_owned());
+                        }
+                        event!(Level::DEBUG, ">>> CacheGet found key: {:?}", cache_key);
+                    }
+                    break;
+                }
+            }
+        }
 
-    let request_builder = match target_method {
-        Method::GET => client.unwrap().get(&target_url.clone()),
-        Method::POST => client.unwrap().post(&target_url.clone()).body(converted_body),
-        _ => unreachable!(),
+        if let Some(key) = cache_key {
+            if let Some(cached_body) = USER_CACHE.get_and_clear(&key) {
+                event!(Level::INFO, "Cache hit for key: {}...", &key[..8.min(key.len())]);
+                Some(cached_body)
+            } else {
+                event!(Level::WARN, "Cache miss for key: {}...", &key[..8.min(key.len())]);
+                None
+            }
+        } else {
+            event!(Level::WARN, ">>> CacheGet: no key found");
+            None
+        }
+    } else {
+        None
     };
 
-    let response = request_builder
-        .headers(headers_map)
-        .send()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("Forward request failed: {}", e),
-            )
-        })?;
+    // 如果是 SSE 请求或 DirectResponse，不发送真实请求
+    let mut response: Option<reqwest::Response> = if is_sse_req || is_direct_response {
+        None
+    } else {
+        let client = ClientBuilder::new()
+            .danger_accept_invalid_hostnames(true)
+            .danger_accept_invalid_certs(true)
+            .redirect(reqwest::redirect::Policy::none())
+            .no_gzip()
+            .build();
 
-    // redirect
-    if response.status().is_redirection() {
-        let mut red_headers_map = header::HeaderMap::new();
-        let location_header = response.headers();
-        red_headers_map.extend(location_header.clone());
-        let b = Vec::<u8>::new();
-        event!(Level::DEBUG, "Redirect Header: {:?}", red_headers_map);
-        return Ok((
-            response.status(),
-            red_headers_map,
-            axum::body::Bytes::from(b)
-        ).into_response());
+        let request_builder = match target_method {
+            Method::GET => client.unwrap().get(&target_url.clone()),
+            Method::POST => {
+                // 如果 final_json_map 为空，不发送 body
+                if final_json_map.is_empty() {
+                    client.unwrap().post(&target_url.clone())
+                } else {
+                    client.unwrap().post(&target_url.clone()).body(converted_body)
+                }
+            }
+            _ => unreachable!(),
+        };
+
+        Some(request_builder
+            .headers(headers_map)
+            .send()
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!("Forward request failed: {}", e),
+                )
+            })?)
+    };
+
+    // redirect - cache_hit 时跳过 redirect 处理
+    if let Some(ref resp) = response {
+        if resp.status().is_redirection() {
+            let mut red_headers_map = header::HeaderMap::new();
+            let location_header = resp.headers();
+            red_headers_map.extend(location_header.clone());
+            let b = Vec::<u8>::new();
+            event!(Level::DEBUG, "Redirect Header: {:?}", red_headers_map);
+            return Ok((
+                resp.status(),
+                red_headers_map,
+                axum::body::Bytes::from(b)
+            ).into_response());
+        }
     }
 
     // headers
     let mut res_headers_map = header::HeaderMap::new();
 
     // response mapping processing
-    let res_header = response.headers().clone();
+    let res_header = if let Some(ref resp) = response {
+        resp.headers().clone()
+    } else {
+        header::HeaderMap::new()
+    };
 
     // 未匹配的，添加response header到新header
     res_headers_map.extend(res_header.clone());
 
     event!(Level::DEBUG, "Response Headers: {:?}", res_headers_map);
 
-    let res_status = response.status();
+    let res_status = if let Some(ref resp) = response {
+        resp.status()
+    } else {
+        StatusCode::OK
+    };
 
     event!(Level::DEBUG, "Response res_status: {:?}", res_status);
 
@@ -1062,23 +1404,27 @@ async fn proxy_handler(
 
         event!(Level::DEBUG, "SSE request, ignore response config");
 
+        // 需要获取 response 的所有权
+        let stream_response = response.take();
         let stream = async_stream::stream! {
-            let mut stream = response.bytes_stream();
-            while let Some(chunk) = stream.next().await {
-                let chunk = match chunk {
-                        Ok(c) => c,
-                        Err(e) => {
-                            let error_msg = format!("Error: {}", e);
-                            yield Ok::<Vec<u8>, std::io::Error>(error_msg.into_bytes()); 
-                            continue;
-                        }
-                    };
-                event!(Level::DEBUG, "SSE chunk: {:?}", chunk);
+            if let Some(resp) = stream_response {
+                let mut stream = resp.bytes_stream();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = match chunk {
+                            Ok(c) => c,
+                            Err(e) => {
+                                let error_msg = format!("Error: {}", e);
+                                yield Ok::<Vec<u8>, std::io::Error>(error_msg.into_bytes());
+                                continue;
+                            }
+                        };
+                    event!(Level::DEBUG, "SSE chunk: {:?}", chunk);
 
-                yield Ok(
-                    chunk.to_vec()
-                );
-            };
+                    yield Ok(
+                        chunk.to_vec()
+                    );
+                };
+            }
         };
 
         return Ok((
@@ -1097,78 +1443,241 @@ async fn proxy_handler(
                 Level::DEBUG,
                 "No need process mix, Return response directly"
             );
+            let body_bytes = if cache_config.is_some() {
+                cache_config.clone().unwrap().to_string().into_bytes()
+            } else if let Some(resp) = response.take() {
+                resp.bytes().await.unwrap().to_vec()
+            } else {
+                Vec::new()
+            };
             return Ok((
                 res_status,
                 res_headers_map,
-                axum::body::Bytes::from(response.bytes().await.unwrap()),
+                axum::body::Bytes::from(body_bytes),
             )
                 .into_response());
         }
     }
 
-    let res_body = response.bytes().await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Body read failed: {}", e),
-        )
-    })?;
+    let res_body = if cache_config.is_some() {
+        cache_config.clone().unwrap().to_string().into_bytes()
+    } else if let Some(resp) = response.take() {
+        resp.bytes().await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Body read failed: {}", e),
+            )
+        })?.to_vec()
+    } else {
+        Vec::new()
+    };
 
+    event!(Level::INFO, "Received response {} from {}", res_status, target_url);
     event!(
-        Level::INFO,
-        "Received Response {} from {} | Headers: {:?} | Body size: {} bytes",
-        res_status,
-        target_url,
+        Level::DEBUG,
+        "Response headers: {:?} | Body size: {} bytes",
         res_header
             .iter()
             .map(|(n, v)| format!("{}={}", n, v.to_str().unwrap()))
             .collect::<Vec<_>>(),
         res_body.len()
     );
-    
+
     let mut _rb = String::new();
-    _rb = String::from_utf8(res_body.clone().to_vec()).unwrap();
+    _rb = String::from_utf8(res_body.clone()).unwrap();
     event!(Level::DEBUG, "Response origin Body: {:?}", &_rb);
 
     // body
     let mut res_json_map = HashMap::new();
+    let mut res_json_data: Option<Value> = None; // 保存原始 JSON 用于缓存
 
-    let res_content_type = res_headers_map.get(header::CONTENT_TYPE).cloned().ok_or((
-        StatusCode::BAD_REQUEST,
-        format!("Missing Header: content-type"),
-    ))?;
+    // 如果是 cache_hit，直接用缓存数据初始化 res_json_map
+    if cache_config.is_some() {
+        let cached_body = cache_config.clone().unwrap();
+        res_json_data = Some(cached_body.clone());
+        json_to_flat_map(&cached_body, "", &mut res_json_map);
+    } else {
+        let res_content_type = res_headers_map.get(header::CONTENT_TYPE).cloned().ok_or((
+            StatusCode::BAD_REQUEST,
+            format!("Missing Header: content-type"),
+        ))?;
 
-    // 根据 response content-type 解析 res_body 数据
-    if res_content_type
-        .to_str()
-        .unwrap()
-        .starts_with(mime::APPLICATION_JSON.essence_str()) || 
-        res_content_type
-        .to_str()
-        .unwrap()
-        .starts_with(mime::TEXT_PLAIN.essence_str())
-    {
-        // json
-        let json_data: Value = serde_json::from_slice(&res_body)
-            .map_err(|e| (StatusCode::BAD_REQUEST, format!("JSON parse error: {}", e)))?;
-        json_to_flat_map(&json_data, "", &mut res_json_map);
-    } else if res_content_type
-        .to_str()
-        .unwrap()
-        .starts_with(mime::APPLICATION_WWW_FORM_URLENCODED.essence_str())
-    {
-        // form
-        let form_data = serde_urlencoded::from_bytes::<HashMap<String, Value>>(&res_body)
-            .map_err(|e| (StatusCode::BAD_REQUEST, format!("Form parse error: {}", e)))?;
-        res_json_map = form_data.clone();
+        // 根据 response content-type 解析 res_body 数据
+        if res_content_type
+            .to_str()
+            .unwrap()
+            .starts_with(mime::APPLICATION_JSON.essence_str()) ||
+            res_content_type
+                .to_str()
+                .unwrap()
+                .starts_with(mime::TEXT_PLAIN.essence_str())
+        {
+            // json
+            let json_data: Value = serde_json::from_slice(&res_body)
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("JSON parse error: {}", e)))?;
+            res_json_data = Some(json_data.clone());
+            json_to_flat_map(&json_data, "", &mut res_json_map);
+        } else if res_content_type
+            .to_str()
+            .unwrap()
+            .starts_with(mime::APPLICATION_WWW_FORM_URLENCODED.essence_str())
+        {
+            // form
+            let form_data = serde_urlencoded::from_bytes::<HashMap<String, Value>>(&res_body)
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("Form parse error: {}", e)))?;
+            res_json_map = form_data.clone();
+            // form 数据也包装成 JSON 保存
+            res_json_data = Some(serde_json::to_value(&form_data).unwrap_or(Value::Null));
+        }
     }
 
     // 处理response.mix_mappings
     if let Some(conf) = &config {
         for mapping in &conf.response.mix_mappings {
             let m = mapping.clone();
+            let s = m.source.clone();
             let t = m.target.clone();
             let trans_s = m.transformations.clone();
-            match (&m.source, t) {
+            
+            // 处理 CacheSet（它不需要 source 和 target）
+            match &m.action {
+                MixAction::CacheSet => {
+                    // 从 res_json_map 中提取缓存 key，缓存整个响应 JSON
+                    if let Some(key_field) = &m.cache_key_field {
+                        event!(Level::DEBUG, ">>> CacheSet looking for key_field: {}", key_field);
+                        event!(Level::DEBUG, ">>> res_json_map keys: {:?}", res_json_map.keys().collect::<Vec<_>>());
+                        if let Some(key) = res_json_map.get(key_field) {
+                            let key_str = key.as_str().unwrap_or_default().to_string();
+                            event!(Level::DEBUG, ">>> CacheSet found key: {}", key_str);
+                            let expires = m.cache_expires_in.unwrap_or(3600);
+                            if let Some(body) = res_json_data.clone() {
+                                event!(Level::DEBUG, ">>> CacheSet caching body: {:?}", body);
+                                USER_CACHE.set(key_str, body, expires);
+                                event!(Level::INFO, "Response cached successfully");
+                            }
+                        } else {
+                            event!(Level::WARN, ">>> CacheSet key not found in res_json_map");
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            
+            if s.is_none() || t.is_none() {
+                continue;
+            }
+            let s = s.unwrap();
+            let t = t.unwrap();
+            match (&s, t) {
+                // 从原始 request query 中获取数据
+                (MixSource::ReqQuery(src), MixTarget::Header(dst)) => {
+                    // 先从 req_query 解析获取
+                    let req_query_map = query_to_multimap(&req_query);
+                    if let Some(value) = req_query_map.get(src) {
+                        let value_str = value.join(",");
+                        let mut header_value = HeaderValue::from_str(&value_str).unwrap();
+                        if let Some(trans) = trans_s.clone() {
+                            let dst_val: Option<String> = get_header_val(&mut res_headers_map, &MixAction::Copy, &dst)
+                                .map_or(None, |v| Some(v.to_str().unwrap().to_string()));
+                            if let Some(transformed) =
+                            apply_transformations(&trans, &value_str, dst_val.as_deref(), Some(&query_map)).await
+                            {
+                                header_value = transformed.parse().unwrap();
+                            }
+                        }
+                        let obj = Box::leak(Box::new(dst));
+                        res_headers_map.insert(obj.as_str(), header_value);
+                    }
+                }
+                (MixSource::ReqQuery(src), MixTarget::BodyField(dst)) => {
+                    let req_query_map = query_to_multimap(&req_query);
+                    if let Some(value) = req_query_map.get(src) {
+                        let value_str = value.join(",");
+                        let mut final_value = value_str.clone();
+                        if let Some(trans) = trans_s.clone() {
+                            let dst_val: Option<String> = get_bodymap_val(&mut res_json_map, &MixAction::Copy, &dst)
+                                .map_or(None, |v| Some(v.as_str().unwrap().to_string()));
+                            if let Some(transformed) =
+                            apply_transformations(&trans, &value_str, dst_val.as_deref(), Some(&query_map)).await
+                            {
+                                final_value = transformed;
+                            }
+                        }
+                        let obj = Box::leak(Box::new(dst));
+                        res_json_map.insert(obj.to_string(), Value::String(final_value));
+                    }
+                }
+                (MixSource::ReqQuery(src), MixTarget::Query(dst)) => {
+                    let req_query_map = query_to_multimap(&req_query);
+                    if let Some(value) = req_query_map.get(src) {
+                        let value_str = value.join(",");
+                        let mut final_value = value.clone();
+                        if let Some(trans) = trans_s.clone() {
+                            let dst_val: Option<String> = get_querymap_val(&mut query_map, &MixAction::Copy, &dst)
+                                .map_or(None, |v| Some(v.join(",")));
+                            if let Some(transformed) =
+                            apply_transformations(&trans, &value_str, dst_val.as_deref(), Some(&query_map)).await
+                            {
+                                final_value = vec![transformed];
+                            }
+                        }
+                        let obj = Box::leak(Box::new(dst));
+                        query_map.insert(obj.to_string(), final_value);
+                    }
+                }
+                // 从原始 request header 中获取数据
+                (MixSource::ReqHeader(src), MixTarget::Header(dst)) => {
+                    if let Some(value) = req_headers.get(src) {
+                        let value_str = value.to_str().unwrap_or_default().to_string();
+                        let mut header_value = value.clone();
+                        if let Some(trans) = trans_s.clone() {
+                            let dst_val: Option<String> = get_header_val(&mut res_headers_map, &MixAction::Copy, &dst)
+                                .map_or(None, |v| Some(v.to_str().unwrap().to_string()));
+                            if let Some(transformed) =
+                            apply_transformations(&trans, &value_str, dst_val.as_deref(), Some(&query_map)).await
+                            {
+                                header_value = transformed.parse().unwrap();
+                            }
+                        }
+                        let obj = Box::leak(Box::new(dst));
+                        res_headers_map.insert(obj.as_str(), header_value);
+                    }
+                }
+                (MixSource::ReqHeader(src), MixTarget::BodyField(dst)) => {
+                    if let Some(value) = req_headers.get(src) {
+                        let value_str = value.to_str().unwrap_or_default().to_string();
+                        let mut final_value = value_str.clone();
+                        if let Some(trans) = trans_s.clone() {
+                            let dst_val: Option<String> = get_bodymap_val(&mut res_json_map, &MixAction::Copy, &dst)
+                                .map_or(None, |v| Some(v.as_str().unwrap().to_string()));
+                            if let Some(transformed) =
+                            apply_transformations(&trans, &value_str, dst_val.as_deref(), Some(&query_map)).await
+                            {
+                                final_value = transformed;
+                            }
+                        }
+                        let obj = Box::leak(Box::new(dst));
+                        res_json_map.insert(obj.to_string(), Value::String(final_value));
+                    }
+                }
+                (MixSource::ReqHeader(src), MixTarget::Query(dst)) => {
+                    if let Some(value) = req_headers.get(src) {
+                        let value_str = value.to_str().unwrap_or_default().to_string();
+                        let mut final_value = vec![value_str.clone()];
+                        if let Some(trans) = trans_s.clone() {
+                            let dst_val: Option<String> = get_querymap_val(&mut query_map, &MixAction::Copy, &dst)
+                                .map_or(None, |v| Some(v.join(",")));
+                            if let Some(transformed) =
+                            apply_transformations(&trans, &value_str, dst_val.as_deref(), Some(&query_map)).await
+                            {
+                                final_value = vec![transformed];
+                            }
+                        }
+                        let obj = Box::leak(Box::new(dst));
+                        query_map.insert(obj.to_string(), final_value);
+                    }
+                }
                 // Header to Header
                 (MixSource::Header(src), MixTarget::Header(dst)) => {
                     if let Some(mut value) = get_header_val(&mut res_headers_map, &m.action, src) {
@@ -1176,7 +1685,7 @@ async fn proxy_handler(
                             let dst_val: Option<String> = get_header_val(&mut res_headers_map, &MixAction::Copy, &dst)
                                 .map_or(None, |v| Some(v.to_str().unwrap().to_string()));
                             if let Some(transformed) =
-                            apply_transformations(&trans, &value.to_str().unwrap(),dst_val.as_deref())
+                            apply_transformations(&trans, &value.to_str().unwrap(),dst_val.as_deref(), Some(&query_map)).await
                             {
                                 value = transformed.parse().unwrap();
                             }
@@ -1192,7 +1701,7 @@ async fn proxy_handler(
                             let dst_val: Option<String> = get_bodymap_val(&mut res_json_map, &MixAction::Copy, &dst)
                                 .map_or(None, |v| Some(v.as_str().unwrap().to_string()));
                             if let Some(transformed) =
-                            apply_transformations(&trans, &value.to_str().unwrap(), dst_val.as_deref())
+                            apply_transformations(&trans, &value.to_str().unwrap(), dst_val.as_deref(), Some(&query_map)).await
                             {
                                 value = transformed.parse().unwrap();
                             }
@@ -1231,6 +1740,8 @@ async fn proxy_handler(
                                 res_json_map.remove(k.as_str()); // delete source
                             }
                         }
+                        // CacheSet/CacheGet 不在此处处理
+                        MixAction::CacheSet | MixAction::CacheGet => {}
                     };
                 }
                 // Body to Header
@@ -1254,6 +1765,8 @@ async fn proxy_handler(
                             }
                             None
                         }
+                        // CacheSet/CacheGet 不在此处处理
+                        MixAction::CacheSet | MixAction::CacheGet => None,
                     };
                     if let Some(value) = value {
                         let obj = Box::leak(Box::new(dst));
@@ -1262,7 +1775,13 @@ async fn proxy_handler(
                     }
                 }
                 // 无其他配置
-                _ => {}
+                _ => {
+                    // CacheGet 在请求阶段通过特殊处理，这里不需要做操作
+                    // CacheSet 已经在前面处理了
+                    if matches!(&m.action, MixAction::CacheGet) {
+                        // CacheGet 在请求阶段处理，response 阶段不需要做任何操作
+                    }
+                }
             }
         }
     }
@@ -1351,23 +1870,13 @@ async fn proxy_handler(
 
     let headers = res_headers_map;
 
+    event!(Level::INFO, "Response {} to {}", status, uri);
     event!(Level::DEBUG, "Response status: {:?}", status);
     event!(Level::DEBUG, "Response headers: {:?}", headers);
     let mut _rb = String::new();
     _rb = String::from_utf8(res_converted_body.clone()).unwrap();
     event!(Level::DEBUG, "Response Body: {:?}", &_rb);
-
-    event!(
-        Level::INFO,
-        "Response {} to {} | Headers: {:?} | Body size: {} bytes",
-        status,
-        uri,
-        headers
-            .iter()
-            .map(|(n, v)| format!("{}={}", n, v.to_str().unwrap()))
-            .collect::<Vec<_>>(),
-        body.len()
-    );
+    event!(Level::DEBUG, "Response body size: {} bytes", body.len());
 
     Ok((status, headers, axum::body::Bytes::from(body)).into_response())
 }

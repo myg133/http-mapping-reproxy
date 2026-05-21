@@ -46,6 +46,8 @@ pub enum ServiceType {
     SSO,
     Redirect(Option<String>),
     SSE(String),
+    // 直接响应：不发送真实请求，直接进入 response 流程
+    DirectResponse,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq)]
@@ -57,11 +59,17 @@ pub enum MethodMapping {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct MixMapping {
-    pub source: MixSource,
-    pub target: MixTarget,
+    #[serde(default)]
+    pub source: Option<MixSource>,
+    #[serde(default)]
+    pub target: Option<MixTarget>,
     pub action: MixAction,
     #[serde(default)]
     pub transformations: Option<Vec<Transformation>>,
+    #[serde(default)]
+    pub cache_key_field: Option<String>,
+    #[serde(default)]
+    pub cache_expires_in: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]
@@ -78,6 +86,7 @@ pub enum Transformation {
     Merge,
     Lowercase,
     Uppercase,
+    HttpRequest { url: String, method: Option<String>, body: Option<String>, headers: Option<std::collections::HashMap<String, String>>, query_params: Option<std::collections::HashMap<String, String>>, response_field: Option<String> },
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]
@@ -87,6 +96,9 @@ pub enum MixAction {
     Copy,
     DeleteSrc,
     AddTarget(String),
+    // 缓存操作（配合 MixMapping.cache_key_field 和 cache_expires_in 使用）
+    CacheSet,
+    CacheGet,
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]
@@ -95,6 +107,11 @@ pub enum MixSource {
     Header(String),
     BodyField(String),
     Query(String),
+    // 特殊 source：表示所有 query 参数，用于 httpquery 转换
+    AllQueries,
+    // 从原始 request 中获取数据（用于 response mix mappings）
+    ReqQuery(String),
+    ReqHeader(String),
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]

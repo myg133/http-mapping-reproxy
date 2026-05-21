@@ -1,75 +1,91 @@
 # http-mapping-reproxy
 
-本项目是一个通用的 HTTP 协议字段映射程序，旨在解决不同系统间 HTTP 请求（包括 Query、Header、JSON Body 和 Form Body）字段不兼容的问题，实现灵活的数据转换和适配。
+HTTP 协议字段映射代理服务，支持请求/响应字段转换、缓存、签名等功能。
+
+## 功能特性
+
+- **字段映射**: Query、Header、JSON Body、Form Body 之间的灵活转换
+- **响应混合**: 支持从多个数据源组合响应内容
+- **缓存支持**: 内置 JSON 缓存，可配置缓存 key 和过期时间
+- **环境变量**: 配置文件支持 `${VAR}` 格式的环境变量注入
+- **DirectResponse**: 无需后端服务，直接返回配置数据
 
 ## 项目结构
 
-- `.cargo/`: Cargo 配置文件。
-- `.gitignore`: Git 忽略文件。
-- `.gitmodules`: Git 子模块配置。
-- `Cargo.toml`: Rust 项目清单文件。
-- `Dockerfile`: 用于容器化的 Dockerfile。
-- `config/`: 配置文件，包括映射文件。
-- `kubernetes/`: Kubernetes 部署配置。
-- `src/`: 源代码。
-  - `config.rs`: 配置解析和处理。
-  - `main.rs`: 主应用程序入口点。
+```
+src/
+  main.rs      # 主程序入口
+  config.rs    # 配置解析
+  cache.rs     # 缓存模块
+config/        # 映射配置文件
+projs/config/ # 项目专用配置
+```
 
-## 入门指南
-
-### 先决条件
-
-- Rust（推荐最新稳定版本）
-- Docker（可选，用于容器化部署）
-
-### 安装
-
-1. **克隆仓库：**
-
-   ```bash
-   git clone <repository_url>
-   cd http-mapping-reproxy
-   ```
-
-2. **构建项目：**
-
-   ```bash
-   cargo build --release
-   ```
+## 快速开始
 
 ### 配置
 
-1. **环境变量：**
+1. 复制 `.env.example` 为 `.env` 并配置环境变量
+2. 修改映射配置文件（如 `projs/config/mapping_ruizhong_oauth.yaml`）
 
-   请参考 `.env.example` 文件配置您的环境变量，例如数据库连接、API 密钥等。
-
-2. **映射文件：**
-
-   `config/` 目录包含映射文件（例如 `mapping.yaml`、`mapping_sse.yaml`），这些文件定义了 HTTP 请求中 Query、Header、JSON Body 和 Form Body 之间字段的转换规则。请根据您的具体需求审查和调整这些文件。
-
-### 使用方法
-
-运行服务：
+### 运行
 
 ```bash
 cargo run --release
 ```
 
-对于容器化部署，构建并运行 Docker 镜像：
+## 配置说明
 
-```bash
-docker build -t http-mapping-reproxy .
-docker run -p 8080:8080 http-mapping-reproxy
+### 服务类型 (ServiceType)
+
+| 类型 | 说明 |
+|------|------|
+| `sso` | 代理到 SSO 服务 |
+| `redirect` | 重定向到指定 URL |
+| `sse` | SSE 流式响应 |
+| `directresponse` | 直接返回配置数据 |
+
+### 数据源 (MixSource)
+
+| 类型 | 说明 |
+|------|------|
+| `!query <key>` | 从请求 query 参数获取 |
+| `!header <key>` | 从请求 header 获取 |
+| `!bodyfield <path>` | 从请求 body JSON 字段获取 |
+| `!reqquery <key>` | 从原始请求 query 获取（用于响应混合） |
+| `!reqheader <key>` | 从原始请求 header 获取（用于响应混合） |
+
+### 操作 (MixAction)
+
+| 操作 | 说明 |
+|------|------|
+| `move` | 移动字段 |
+| `copy` | 复制字段 |
+| `deletesrc` | 删除源字段 |
+| `addtarget <value>` | 添加目标字段 |
+| `cacheset` | 将响应数据存入缓存 |
+| `cacheget` | 从缓存获取数据 |
+
+### 转换 (Transformation)
+
+- `split`: 分割字符串
+- `replace`: 替换内容
+- `base64decode`: Base64 解码
+- `lowercase` / `uppercase`: 大小写转换
+- `format`: 格式化字符串
+- `httpquery`: HTTP 请求转换
+- `httpRequest`: 内部 HTTP 请求
+
+## 环境变量
+
+配置文件中支持 `${VAR_NAME}` 格式的环境变量：
+
+```yaml
+target_service: !redirect ${SSO_ADAPTER_SSO_URL}/some/path
 ```
 
-## 部署
-
-`kubernetes/` 目录包含 Kubernetes 部署配置示例。您可以调整这些文件以将服务部署到您的 Kubernetes 集群。
-
-## 贡献
-
-欢迎贡献！如有任何改进或错误修复，请提交问题或拉取请求。
+`.env` 文件会在配置加载前自动读取。
 
 ## 许可证
 
-本项目采用 MIT 许可证 - 有关详细信息，请参阅 LICENSE 文件。
+MIT
