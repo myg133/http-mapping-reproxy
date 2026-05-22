@@ -99,6 +99,8 @@ pub enum MixAction {
     // 缓存操作（配合 MixMapping.cache_key_field 和 cache_expires_in 使用）
     CacheSet,
     CacheGet,
+    // 缓存 header 值（用于跨请求共享）
+    CacheHeaderSet(String),  // 参数为要缓存的 header 名称
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]
@@ -112,6 +114,8 @@ pub enum MixSource {
     // 从原始 request 中获取数据（用于 response mix mappings）
     ReqQuery(String),
     ReqHeader(String),
+    // 从缓存中获取 header（用于跨请求共享数据）
+    CacheHeader,
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]

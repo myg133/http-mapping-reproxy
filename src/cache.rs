@@ -87,6 +87,23 @@ impl JsonCache {
     pub fn len(&self) -> usize {
         self.store.len()
     }
+
+    // 打印所有缓存内容（调试用）
+    pub fn debug_print(&self) {
+        event!(Level::DEBUG, "=== Cache Debug Print ===");
+        event!(Level::DEBUG, "Cache size: {}", self.store.len());
+        for entry in self.store.iter() {
+            let key = entry.key();
+            let value = entry.value();
+            event!(Level::DEBUG, "  [{}] = {:?} (cached {}s ago, expires in {}s)",
+                key,
+                value.body,
+                value.cached_at.elapsed().as_secs(),
+                value.expires_in.saturating_sub(value.cached_at.elapsed().as_secs())
+            );
+        }
+        event!(Level::DEBUG, "=== End Cache Debug ===");
+    }
 }
 
 impl Default for JsonCache {

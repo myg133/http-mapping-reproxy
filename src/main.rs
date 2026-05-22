@@ -459,7 +459,10 @@ async fn apply_transformations(
             }
             Transformation::HttpRequest { url, method, body, headers, query_params, response_field } => {
                 event!(Level::DEBUG, ">>> HttpRequest transformation start");
-                let client = reqwest::Client::new();
+                let client = ClientBuilder::new()
+                    .danger_accept_invalid_certs(true)
+                    .build()
+                    .unwrap_or_else(|_| Client::new());
                 let http_method = method.as_deref().unwrap_or("POST");
                 event!(Level::DEBUG, "    method: {}", http_method);
                 
@@ -596,7 +599,7 @@ fn get_header_val(
             None
         }
         // CacheSet/CacheGet 不在 header 级别处理
-        MixAction::CacheSet | MixAction::CacheGet => None,
+        MixAction::CacheSet | MixAction::CacheGet | MixAction::CacheHeaderSet(_) => None,
     };
     value
 }
@@ -616,7 +619,7 @@ fn get_querymap_val(
             None
         }
         // CacheSet/CacheGet 不在 query 级别处理
-        MixAction::CacheSet | MixAction::CacheGet => None,
+        MixAction::CacheSet | MixAction::CacheGet | MixAction::CacheHeaderSet(_) => None,
     };
     value
 }
@@ -636,7 +639,7 @@ fn get_bodymap_val(
             None
         }
         // CacheSet/CacheGet 不在 body 级别处理
-        MixAction::CacheSet | MixAction::CacheGet => None,
+        MixAction::CacheSet | MixAction::CacheGet | MixAction::CacheHeaderSet(_) => None,
     };
     value
 }
@@ -648,10 +651,13 @@ async fn proxy_handler(
     headers: header::HeaderMap,
     body: Bytes,
 ) -> Result<Response, (StatusCode, String)> {
+    // 打印当前缓存状态（调试用）
+    USER_CACHE.debug_print();
+
     // if method == Method::CONNECT {
     //     return handle_https_tunnel(uri, *addr).await;
     // }
-    
+
     // event!(Level::DEBUG, "origin info {:?}",request);
 
     // let uri: Uri = request.uri().clone();
@@ -803,6 +809,12 @@ async fn proxy_handler(
     // 保存原始 request 的 headers 和 query，供 response mix mappings 使用
     let req_headers = headers.clone();
     let req_query = query.map(|q| q.to_string()).unwrap_or_default();
+    // 解析原始 query 供 response mix mappings 使用
+    let req_query_map = if !req_query.is_empty() {
+        query_to_multimap(&req_query)
+    } else {
+        HashMap::new()
+    };
 
     let content_type = match method {
         Method::POST | Method::PUT => headers.get(header::CONTENT_TYPE).cloned().ok_or((
@@ -845,6 +857,32 @@ async fn proxy_handler(
             let t = m.target.clone();
             let trans_s = m.transformations.clone();
             event!(Level::DEBUG, ">>> mix mapping {}", idx);
+
+            // 处理 CacheHeaderSet（它不需要 source 和 target）
+            match &m.action {
+                MixAction::CacheHeaderSet(header_name) => {
+                    if let Some(key_field) = &m.cache_key_field {
+                        event!(Level::DEBUG, ">>> Request CacheHeaderSet header: {}, key_field: {}", header_name, key_field);
+                        // 从 query_map 中获取 key_field 对应的值作为缓存 key
+                        if let Some(cache_key) = query_map.get(key_field).and_then(|v| v.first()) {
+                            if let Some(value) = headers.get(header_name.as_str()) {
+                                let value_str = value.to_str().unwrap_or_default().to_string();
+                                event!(Level::DEBUG, ">>> CacheHeaderSet cache_key: {}, value: {}", cache_key, value_str);
+                                let expires = m.cache_expires_in.unwrap_or(3600);
+                                USER_CACHE.set(cache_key.clone(), Value::String(value_str), expires);
+                                event!(Level::INFO, "Header {} cached with key {}", header_name, cache_key);
+                            } else {
+                                event!(Level::WARN, ">>> CacheHeaderSet header {} not found in request", header_name);
+                            }
+                        } else {
+                            event!(Level::WARN, ">>> CacheHeaderSet key_field {} not found in query", key_field);
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+
             if s.is_none() || t.is_none() {
                 continue;
             }
@@ -852,7 +890,7 @@ async fn proxy_handler(
             let t = t.unwrap();
             match (&s, t) {
                 // ReqQuery 和 ReqHeader 只在 response mix mappings 中使用
-                (MixSource::ReqQuery(_), _) | (MixSource::ReqHeader(_), _) => {
+                (MixSource::ReqQuery(_) | MixSource::ReqHeader(_), _) => {
                     event!(Level::WARN, "ReqQuery/ReqHeader only supported in response mix_mappings, ignoring");
                 }
                 // Header to Header
@@ -913,6 +951,59 @@ async fn proxy_handler(
                             obj.to_string(),
                             vec![value.clone().to_str().unwrap().to_string()],
                         );
+                    }
+                }
+                // CacheHeader to Query (request 阶段支持)
+                (MixSource::CacheHeader, MixTarget::Query(dst)) => {
+                    event!(Level::DEBUG, ">>> CacheHeader to Query");
+                    if let Some(key_field) = &m.cache_key_field {
+                        // 从 query_map 中获取 key_field 对应的值作为缓存 key
+                        if let Some(cache_key) = query_map.get(key_field).and_then(|v| v.first()) {
+                            if let Some(cached) = USER_CACHE.get(cache_key) {
+                                if let Some(value_str) = cached.as_str() {
+                                    event!(Level::DEBUG, ">>> CacheHeader found: {} -> {}", cache_key, value_str);
+                                    let obj = Box::leak(Box::new(dst));
+                                    query_map.insert(obj.to_string(), vec![value_str.to_string()]);
+                                }
+                            } else {
+                                event!(Level::WARN, ">>> CacheHeader key {} not found in cache", cache_key);
+                            }
+                        } else {
+                            event!(Level::WARN, ">>> CacheHeader key_field {} not found in query", key_field);
+                        }
+                    }
+                }
+                // CacheHeader to Header (request 阶段支持)
+                (MixSource::CacheHeader, MixTarget::Header(dst)) => {
+                    event!(Level::DEBUG, ">>> CacheHeader to Header");
+                    if let Some(key_field) = &m.cache_key_field {
+                        // 从 query_map 中获取 key_field 对应的值作为缓存 key
+                        if let Some(cache_key) = query_map.get(key_field).and_then(|v| v.first()) {
+                            if let Some(cached) = USER_CACHE.get(cache_key) {
+                                if let Some(value_str) = cached.as_str() {
+                                    event!(Level::DEBUG, ">>> CacheHeader found: {} -> {}", cache_key, value_str);
+                                    let header_value: HeaderValue = value_str.parse().unwrap();
+                                    let obj = Box::leak(Box::new(dst));
+                                    headers_map.insert(obj.as_str(), header_value);
+                                }
+                            }
+                        }
+                    }
+                }
+                // CacheHeader to BodyField (request 阶段支持)
+                (MixSource::CacheHeader, MixTarget::BodyField(dst)) => {
+                    event!(Level::DEBUG, ">>> CacheHeader to BodyField");
+                    if let Some(key_field) = &m.cache_key_field {
+                        // 从 query_map 中获取 key_field 对应的值作为缓存 key
+                        if let Some(cache_key) = query_map.get(key_field).and_then(|v| v.first()) {
+                            if let Some(cached) = USER_CACHE.get(cache_key) {
+                                if let Some(value_str) = cached.as_str() {
+                                    event!(Level::DEBUG, ">>> CacheHeader found: {} -> {}", cache_key, value_str);
+                                    let obj = Box::leak(Box::new(dst));
+                                    json_map.insert(obj.to_string(), Value::String(value_str.to_string()));
+                                }
+                            }
+                        }
                     }
                 }
                 // Quert to Query
@@ -1029,7 +1120,7 @@ async fn proxy_handler(
                             }
                         }
                         // CacheSet/CacheGet 不在 request body->body 处理
-                        MixAction::CacheSet | MixAction::CacheGet => {}
+                        MixAction::CacheSet | MixAction::CacheGet | MixAction::CacheHeaderSet(_) => {}
                     };
                 }
                 // Body to Query
@@ -1055,7 +1146,7 @@ async fn proxy_handler(
                             None
                         }
                         // CacheSet/CacheGet 不在 request body->query 处理
-                        MixAction::CacheSet | MixAction::CacheGet => None,
+                        MixAction::CacheSet | MixAction::CacheGet | MixAction::CacheHeaderSet(_) => None,
                     };
                     if let Some(value) = value {
                         let obj = Box::leak(Box::new(dst));
@@ -1090,7 +1181,7 @@ async fn proxy_handler(
                             None
                         }
                         // CacheSet/CacheGet 不在 request body->header 处理
-                        MixAction::CacheSet | MixAction::CacheGet => None,
+                        MixAction::CacheSet | MixAction::CacheGet | MixAction::CacheHeaderSet(_) => None,
                     };
                     if let Some(value) = value {
                         let obj = Box::leak(Box::new(dst));
@@ -1539,7 +1630,7 @@ async fn proxy_handler(
             let t = m.target.clone();
             let trans_s = m.transformations.clone();
             
-            // 处理 CacheSet（它不需要 source 和 target）
+            // 处理 CacheSet 和 CacheHeaderSet（它们不需要 source 和 target）
             match &m.action {
                 MixAction::CacheSet => {
                     // 从 res_json_map 中提取缓存 key，缓存整个响应 JSON
@@ -1557,6 +1648,24 @@ async fn proxy_handler(
                             }
                         } else {
                             event!(Level::WARN, ">>> CacheSet key not found in res_json_map");
+                        }
+                    }
+                    continue;
+                }
+                MixAction::CacheHeaderSet(header_name) => {
+                    // 从原始请求 headers 中提取指定 header 并缓存
+                    if let Some(key_field) = &m.cache_key_field {
+                        event!(Level::DEBUG, ">>> CacheHeaderSet header: {}, key_field: {}", header_name, key_field);
+                        // 从 req_headers 获取要缓存的 header 值
+                        if let Some(value) = req_headers.get(header_name) {
+                            let value_str = value.to_str().unwrap_or_default().to_string();
+                            event!(Level::DEBUG, ">>> CacheHeaderSet value: {}", value_str);
+                            let expires = m.cache_expires_in.unwrap_or(3600);
+                            // 使用 key_field 作为缓存 key，缓存 header 值
+                            USER_CACHE.set(key_field.clone(), Value::String(value_str), expires);
+                            event!(Level::INFO, "Header {} cached with key {}", header_name, key_field);
+                        } else {
+                            event!(Level::WARN, ">>> CacheHeaderSet header {} not found in request", header_name);
                         }
                     }
                     continue;
@@ -1678,6 +1787,52 @@ async fn proxy_handler(
                         query_map.insert(obj.to_string(), final_value);
                     }
                 }
+                // 从缓存中获取 header（用于跨请求共享数据）
+                (MixSource::CacheHeader, MixTarget::Header(dst)) => {
+                    // 从 req_query_map 中获取 key_field 对应的值作为缓存 key
+                    if let Some(key_field) = &m.cache_key_field {
+                        if let Some(cache_key) = req_query_map.get(key_field).and_then(|v| v.first()) {
+                            if let Some(cached) = USER_CACHE.get(cache_key) {
+                                if let Some(value_str) = cached.as_str() {
+                                    event!(Level::DEBUG, ">>> CacheHeader {} found: {}", cache_key, value_str);
+                                    let header_value: HeaderValue = value_str.parse().unwrap();
+                                    let obj = Box::leak(Box::new(dst));
+                                    res_headers_map.insert(obj.as_str(), header_value);
+                                }
+                            } else {
+                                event!(Level::WARN, ">>> CacheHeader key {} not found in cache", cache_key);
+                            }
+                        } else {
+                            event!(Level::WARN, ">>> CacheHeader key_field {} not found in req_query", key_field);
+                        }
+                    }
+                }
+                (MixSource::CacheHeader, MixTarget::BodyField(dst)) => {
+                    if let Some(key_field) = &m.cache_key_field {
+                        if let Some(cache_key) = req_query_map.get(key_field).and_then(|v| v.first()) {
+                            if let Some(cached) = USER_CACHE.get(cache_key) {
+                                if let Some(value_str) = cached.as_str() {
+                                    event!(Level::DEBUG, ">>> CacheHeader {} found: {}", cache_key, value_str);
+                                    let obj = Box::leak(Box::new(dst));
+                                    res_json_map.insert(obj.to_string(), Value::String(value_str.to_string()));
+                                }
+                            }
+                        }
+                    }
+                }
+                (MixSource::CacheHeader, MixTarget::Query(dst)) => {
+                    if let Some(key_field) = &m.cache_key_field {
+                        if let Some(cache_key) = req_query_map.get(key_field).and_then(|v| v.first()) {
+                            if let Some(cached) = USER_CACHE.get(cache_key) {
+                                if let Some(value_str) = cached.as_str() {
+                                    event!(Level::DEBUG, ">>> CacheHeader {} found: {}", cache_key, value_str);
+                                    let obj = Box::leak(Box::new(dst));
+                                    query_map.insert(obj.to_string(), vec![value_str.to_string()]);
+                                }
+                            }
+                        }
+                    }
+                }
                 // Header to Header
                 (MixSource::Header(src), MixTarget::Header(dst)) => {
                     if let Some(mut value) = get_header_val(&mut res_headers_map, &m.action, src) {
@@ -1741,7 +1896,7 @@ async fn proxy_handler(
                             }
                         }
                         // CacheSet/CacheGet 不在此处处理
-                        MixAction::CacheSet | MixAction::CacheGet => {}
+                        MixAction::CacheSet | MixAction::CacheGet | MixAction::CacheHeaderSet(_) => {}
                     };
                 }
                 // Body to Header
@@ -1766,7 +1921,7 @@ async fn proxy_handler(
                             None
                         }
                         // CacheSet/CacheGet 不在此处处理
-                        MixAction::CacheSet | MixAction::CacheGet => None,
+                        MixAction::CacheSet | MixAction::CacheGet | MixAction::CacheHeaderSet(_) => None,
                     };
                     if let Some(value) = value {
                         let obj = Box::leak(Box::new(dst));
