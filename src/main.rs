@@ -2,7 +2,7 @@
 mod cache;
 
 use axum::{
-    body::{Bytes, Body},
+    body::{Body, Bytes},
     http::{header, Method, StatusCode, Uri},
     response::sse::{Event, KeepAlive, Sse},
     response::IntoResponse,
@@ -13,14 +13,18 @@ use axum::{
 use base64::prelude::*;
 use cache::{create_shared_cache, SharedCache};
 use config::{Transformation, UseMode};
+use core::convert::Into;
 use futures_util::StreamExt;
-use reqwest::{Client,ClientBuilder};
 use hyper::{header::HeaderValue, HeaderMap};
 use once_cell::sync::Lazy;
+use reqwest::{Client, ClientBuilder};
 use serde_json::{Map, Value};
-use core::convert::Into;
 use std::{
-    collections::HashMap, convert::Infallible, fmt::format, net::SocketAddr, str::{self, FromStr}
+    collections::HashMap,
+    convert::Infallible,
+    fmt::format,
+    net::SocketAddr,
+    str::{self, FromStr},
 };
 use tokio::task::yield_now;
 use tracing::{event, Level};
@@ -45,7 +49,8 @@ fn substitute_env_vars(content: &str) -> String {
     re.replace_all(content, |caps: &regex::Captures| {
         let var_name = &caps[1];
         std::env::var(var_name).unwrap_or_else(|_| caps[0].to_string())
-    }).to_string()
+    })
+    .to_string()
 }
 
 async fn load_config() -> anyhow::Result<(AppConfig, HashMap<String, PathConfig>)> {
@@ -176,7 +181,7 @@ fn insert_recursive(current: &mut Value, parts: &[&str], value: Value) {
             arr[index] = value;
         }
         // 初始化元素为对象（如果当前位置是Null）
-        else{
+        else {
             if arr[index] == Value::Null {
                 arr[index] = Value::Object(Map::new());
             }
@@ -269,7 +274,7 @@ pub fn multimap_to_query(multimap: &HashMap<String, Vec<String>>) -> String {
 fn query_map_to_sorted_string(query_map: &HashMap<String, Vec<String>>) -> String {
     let mut keys: Vec<&String> = query_map.keys().collect();
     keys.sort();
-    
+
     let mut parts = Vec::new();
     for key in keys {
         if let Some(values) = query_map.get(key) {
@@ -312,16 +317,21 @@ fn json_body_to_string(
     let mut pairs = Vec::new();
 
     if map.len() == 1 {
-        return map.values().take(1).nth(0).unwrap().as_str().unwrap().to_string();
+        return map
+            .values()
+            .take(1)
+            .nth(0)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
     }
     for (k, v) in map {
         let value_str = match v {
             Value::String(s) => s.as_str().to_string(),
             _ => v.to_string(),
         };
-        let formatted = format
-            .replace("{key}", k)
-            .replace("{value}", &value_str);
+        let formatted = format.replace("{key}", k).replace("{value}", &value_str);
         pairs.push(formatted);
     }
     // 按字母顺序排序保证一致性
@@ -369,11 +379,11 @@ fn map_to_form_body(
 
 // 处理转换
 async fn apply_transformations(
-        transformations: &[Transformation],
-        value: &str,
-        dst_value: Option<&str>,
-        query_map: Option<&std::collections::HashMap<String, Vec<String>>>
-    ) -> Option<String> {
+    transformations: &[Transformation],
+    value: &str,
+    dst_value: Option<&str>,
+    query_map: Option<&std::collections::HashMap<String, Vec<String>>>,
+) -> Option<String> {
     let mut result = value.to_string();
 
     // 占位符替换的辅助函数
@@ -382,14 +392,27 @@ async fn apply_transformations(
         event!(Level::DEBUG, "[replace_placeholders] input: {}", res);
         // 替换 {input}
         res = res.replace("{input}", current_result);
-        event!(Level::DEBUG, "[replace_placeholders] after {{input}}: {}", res);
+        event!(
+            Level::DEBUG,
+            "[replace_placeholders] after {{input}}: {}",
+            res
+        );
         // 替换 {query:key}
         if let Some(qm) = query_map {
-            event!(Level::DEBUG, "[replace_placeholders] query_map keys: {:?}", qm.keys().collect::<Vec<_>>());
+            event!(
+                Level::DEBUG,
+                "[replace_placeholders] query_map keys: {:?}",
+                qm.keys().collect::<Vec<_>>()
+            );
             for (key, vals) in qm.iter() {
                 if let Some(v) = vals.first() {
                     let pattern = format!("{{query:{}}}", key);
-                    event!(Level::DEBUG, "[replace_placeholders] trying to replace: {} -> {}", pattern, v);
+                    event!(
+                        Level::DEBUG,
+                        "[replace_placeholders] trying to replace: {} -> {}",
+                        pattern,
+                        v
+                    );
                     res = res.replace(&pattern, v);
                 }
             }
@@ -413,8 +436,7 @@ async fn apply_transformations(
                     .unwrap_or_default();
             }
             Transformation::Base64Encode => {
-                result = base64::prelude::BASE64_STANDARD
-                    .encode(&result);
+                result = base64::prelude::BASE64_STANDARD.encode(&result);
             }
             Transformation::Split { separator, index } => {
                 result = result
@@ -447,9 +469,10 @@ async fn apply_transformations(
             // Test
             Transformation::Extract { regex } => {
                 let re = Regex::new(regex).unwrap();
-                result = re.find(&result)
-                .map(|mat| mat.as_str().to_string())
-                .unwrap_or_else(|| result);
+                result = re
+                    .find(&result)
+                    .map(|mat| mat.as_str().to_string())
+                    .unwrap_or_else(|| result);
             }
             Transformation::Lowercase => {
                 result = result.to_lowercase();
@@ -457,7 +480,14 @@ async fn apply_transformations(
             Transformation::Uppercase => {
                 result = result.to_uppercase();
             }
-            Transformation::HttpRequest { url, method, body, headers, query_params, response_field } => {
+            Transformation::HttpRequest {
+                url,
+                method,
+                body,
+                headers,
+                query_params,
+                response_field,
+            } => {
                 event!(Level::DEBUG, ">>> HttpRequest transformation start");
                 let client = ClientBuilder::new()
                     .danger_accept_invalid_certs(true)
@@ -465,11 +495,11 @@ async fn apply_transformations(
                     .unwrap_or_else(|_| Client::new());
                 let http_method = method.as_deref().unwrap_or("POST");
                 event!(Level::DEBUG, "    method: {}", http_method);
-                
+
                 // 处理 URL 占位符替换
                 let processed_url = replace_placeholders(url, &result);
                 event!(Level::DEBUG, "    url: {} -> {}", url, processed_url);
-                
+
                 let mut request_builder = match http_method.to_uppercase().as_str() {
                     "GET" => client.get(processed_url),
                     "POST" => client.post(processed_url),
@@ -480,18 +510,20 @@ async fn apply_transformations(
                         return None;
                     }
                 };
-                
+
                 // 添加 headers
                 if let Some(header_map) = headers {
                     for (key, val) in header_map {
                         let processed_val = replace_placeholders(val, &result);
                         event!(Level::DEBUG, "    header: {} -> {}", key, processed_val);
-                        if let Ok(header_val) = reqwest::header::HeaderValue::from_str(&processed_val) {
+                        if let Ok(header_val) =
+                            reqwest::header::HeaderValue::from_str(&processed_val)
+                        {
                             request_builder = request_builder.header(key, header_val);
                         }
                     }
                 }
-                
+
                 // 添加 query params
                 if let Some(query_map) = query_params {
                     for (key, val) in query_map {
@@ -500,17 +532,22 @@ async fn apply_transformations(
                         request_builder = request_builder.query(&[(key, processed_val)]);
                     }
                 }
-                
+
                 // 如果有 body，设置请求体
                 if let Some(body_content) = body {
                     let processed_body = replace_placeholders(body_content, &result);
-                    event!(Level::DEBUG, "    body: {} -> {}", body_content, processed_body);
+                    event!(
+                        Level::DEBUG,
+                        "    body: {} -> {}",
+                        body_content,
+                        processed_body
+                    );
                     request_builder = request_builder.body(processed_body);
                 } else {
                     event!(Level::DEBUG, "    body (no config): {}", result);
                     request_builder = request_builder.body(result.clone());
                 }
-                
+
                 // 构建请求并打印完整 URL
                 if let Some(cloned) = request_builder.try_clone() {
                     match cloned.build() {
@@ -522,9 +559,12 @@ async fn apply_transformations(
                         }
                     }
                 } else {
-                    event!(Level::WARN, "<<< HttpRequest failed to clone builder for URL logging");
+                    event!(
+                        Level::WARN,
+                        "<<< HttpRequest failed to clone builder for URL logging"
+                    );
                 }
-                
+
                 // 发送请求并获取响应
                 event!(Level::DEBUG, "<<< HttpRequest sending...");
                 match request_builder.send().await {
@@ -533,28 +573,53 @@ async fn apply_transformations(
                         match response.text().await {
                             Ok(text) => {
                                 event!(Level::DEBUG, "    response body: {}", text);
-                                
+
                                 // 如果配置了 response_field，则从 JSON 中提取该字段
                                 if let Some(field) = response_field {
                                     event!(Level::DEBUG, "    Extracting field: {}", field);
                                     match serde_json::from_str::<serde_json::Value>(&text) {
                                         Ok(json) => {
-                                            if let Some(value) = json.get(field) {
+                                            // 支持 JSON Pointer（以 / 开头）取嵌套/数组元素；
+                                            // 兼容旧的纯 key 写法（不含 / 时走 json.get）
+                                            let value_opt: Option<&serde_json::Value> =
+                                                if field.starts_with('/') {
+                                                    json.pointer(field)
+                                                } else {
+                                                    json.get(field)
+                                                };
+
+                                            if let Some(value) = value_opt {
                                                 if let Some(str_value) = value.as_str() {
                                                     result = str_value.to_string();
-                                                    event!(Level::DEBUG, "    Extracted value: {}", result);
+                                                    event!(
+                                                        Level::DEBUG,
+                                                        "    Extracted value: {}",
+                                                        result
+                                                    );
                                                 } else {
                                                     // 如果不是字符串，直接转为字符串
                                                     result = value.to_string();
-                                                    event!(Level::DEBUG, "    Extracted non-string value: {}", result);
+                                                    event!(
+                                                        Level::DEBUG,
+                                                        "    Extracted non-string value: {}",
+                                                        result
+                                                    );
                                                 }
                                             } else {
-                                                event!(Level::WARN, "    Field '{}' not found in response", field);
+                                                event!(
+                                                    Level::WARN,
+                                                    "    Field '{}' not found in response",
+                                                    field
+                                                );
                                                 result = text;
                                             }
                                         }
                                         Err(e) => {
-                                            event!(Level::WARN, "    Failed to parse response as JSON: {:?}", e);
+                                            event!(
+                                                Level::WARN,
+                                                "    Failed to parse response as JSON: {:?}",
+                                                e
+                                            );
                                             result = text;
                                         }
                                     }
@@ -708,22 +773,22 @@ async fn proxy_handler(
                             if let Some(u) = url {
                                 path = "";
                                 &u.clone()
-                            }
-                            else {
+                            } else {
                                 &app_config
-                                .sso_url
-                                .ok_or((
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    format!("SSO URL not configured"),
-                                ))?
-                                .clone()
+                                    .sso_url
+                                    .ok_or((
+                                        StatusCode::INTERNAL_SERVER_ERROR,
+                                        format!("SSO URL not configured"),
+                                    ))?
+                                    .clone()
                             }
                         }
-                        ServiceType::SSO | ServiceType::SSE(_) | ServiceType::DirectResponse => &uri
-                            .host()
-                            .ok_or((StatusCode::BAD_REQUEST, format!("Host header missing")))?
-                            .to_string()
-                            .clone(), // 使用原始请求的host
+                        ServiceType::SSO | ServiceType::SSE(_) | ServiceType::DirectResponse => {
+                            &uri.host()
+                                .ok_or((StatusCode::BAD_REQUEST, format!("Host header missing")))?
+                                .to_string()
+                                .clone()
+                        } // 使用原始请求的host
                     },
                 ),
                 // 未命中配置，判断是否为入栈请求，入栈请求则转发到 dify_url，否则转发到原始请求的host
@@ -770,24 +835,25 @@ async fn proxy_handler(
                         if let Some(u) = url {
                             path = "";
                             &u.clone()
-                        }
-                        else {
+                        } else {
                             &app_config
+                                .sso_url
+                                .ok_or((
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    format!("SSO URL not configured"),
+                                ))?
+                                .clone()
+                        }
+                    }
+                    ServiceType::SSO | ServiceType::SSE(_) | ServiceType::DirectResponse => {
+                        &app_config
                             .sso_url
                             .ok_or((
                                 StatusCode::INTERNAL_SERVER_ERROR,
                                 format!("SSO URL not configured"),
                             ))?
                             .clone()
-                        }
                     }
-                    ServiceType::SSO | ServiceType::SSE(_) | ServiceType::DirectResponse => &app_config
-                        .sso_url
-                        .ok_or((
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("SSO URL not configured"),
-                        ))?
-                        .clone(),
                 },
             )
         }
@@ -805,7 +871,7 @@ async fn proxy_handler(
     let mut json_map = HashMap::new();
     // headers
     let mut headers_map = HeaderMap::new();
-    
+
     // 保存原始 request 的 headers 和 query，供 response mix mappings 使用
     let req_headers = headers.clone();
     let req_query = query.map(|q| q.to_string()).unwrap_or_default();
@@ -825,8 +891,12 @@ async fn proxy_handler(
     };
 
     // 打印原始 body 内容
-    event!(Level::DEBUG, "Raw request body: {}", String::from_utf8_lossy(&body));
-    
+    event!(
+        Level::DEBUG,
+        "Raw request body: {}",
+        String::from_utf8_lossy(&body)
+    );
+
     // 根据 content-type 解析 body 数据
     if content_type == mime::APPLICATION_JSON.essence_str() {
         // json
@@ -839,7 +909,7 @@ async fn proxy_handler(
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("Form parse error: {}", e)))?;
         json_map = form_data.clone();
     }
-    
+
     // 打印解析后的 body map
     event!(Level::DEBUG, "Parsed json_map: {:?}", json_map);
 
@@ -850,7 +920,11 @@ async fn proxy_handler(
 
     // 处理request.mix_mappings
     if let Some(conf) = &config {
-        event!(Level::DEBUG, ">>> Starting mix mappings, query_map keys: {:?}", query_map.keys().collect::<Vec<_>>());
+        event!(
+            Level::DEBUG,
+            ">>> Starting mix mappings, query_map keys: {:?}",
+            query_map.keys().collect::<Vec<_>>()
+        );
         for (idx, mapping) in conf.request.mix_mappings.iter().enumerate() {
             let m = mapping.clone();
             let s = m.source.clone();
@@ -862,20 +936,47 @@ async fn proxy_handler(
             match &m.action {
                 MixAction::CacheHeaderSet(header_name) => {
                     if let Some(key_field) = &m.cache_key_field {
-                        event!(Level::DEBUG, ">>> Request CacheHeaderSet header: {}, key_field: {}", header_name, key_field);
+                        event!(
+                            Level::DEBUG,
+                            ">>> Request CacheHeaderSet header: {}, key_field: {}",
+                            header_name,
+                            key_field
+                        );
                         // 从 query_map 中获取 key_field 对应的值作为缓存 key
                         if let Some(cache_key) = query_map.get(key_field).and_then(|v| v.first()) {
                             if let Some(value) = headers.get(header_name.as_str()) {
                                 let value_str = value.to_str().unwrap_or_default().to_string();
-                                event!(Level::DEBUG, ">>> CacheHeaderSet cache_key: {}, value: {}", cache_key, value_str);
+                                event!(
+                                    Level::DEBUG,
+                                    ">>> CacheHeaderSet cache_key: {}, value: {}",
+                                    cache_key,
+                                    value_str
+                                );
                                 let expires = m.cache_expires_in.unwrap_or(3600);
-                                USER_CACHE.set(cache_key.clone(), Value::String(value_str), expires);
-                                event!(Level::INFO, "Header {} cached with key {}", header_name, cache_key);
+                                USER_CACHE.set(
+                                    cache_key.clone(),
+                                    Value::String(value_str),
+                                    expires,
+                                );
+                                event!(
+                                    Level::INFO,
+                                    "Header {} cached with key {}",
+                                    header_name,
+                                    cache_key
+                                );
                             } else {
-                                event!(Level::WARN, ">>> CacheHeaderSet header {} not found in request", header_name);
+                                event!(
+                                    Level::WARN,
+                                    ">>> CacheHeaderSet header {} not found in request",
+                                    header_name
+                                );
                             }
                         } else {
-                            event!(Level::WARN, ">>> CacheHeaderSet key_field {} not found in query", key_field);
+                            event!(
+                                Level::WARN,
+                                ">>> CacheHeaderSet key_field {} not found in query",
+                                key_field
+                            );
                         }
                     }
                     continue;
@@ -891,16 +992,25 @@ async fn proxy_handler(
             match (&s, t) {
                 // ReqQuery 和 ReqHeader 只在 response mix mappings 中使用
                 (MixSource::ReqQuery(_) | MixSource::ReqHeader(_), _) => {
-                    event!(Level::WARN, "ReqQuery/ReqHeader only supported in response mix_mappings, ignoring");
+                    event!(
+                        Level::WARN,
+                        "ReqQuery/ReqHeader only supported in response mix_mappings, ignoring"
+                    );
                 }
                 // Header to Header
                 (MixSource::Header(src), MixTarget::Header(dst)) => {
                     if let Some(mut value) = get_header_val(&mut headers_map, &m.action, src) {
                         if let Some(trans) = trans_s.clone() {
-                            let dst_val: Option<String> = get_header_val(&mut headers_map, &MixAction::Copy, &dst)
-                                .map_or(None, |v| Some(v.to_str().unwrap().to_string()));
-                            if let Some(transformed) =
-                            apply_transformations(&trans, &value.to_str().unwrap(), dst_val.as_deref(), Some(&query_map)).await
+                            let dst_val: Option<String> =
+                                get_header_val(&mut headers_map, &MixAction::Copy, &dst)
+                                    .map_or(None, |v| Some(v.to_str().unwrap().to_string()));
+                            if let Some(transformed) = apply_transformations(
+                                &trans,
+                                &value.to_str().unwrap(),
+                                dst_val.as_deref(),
+                                Some(&query_map),
+                            )
+                            .await
                             {
                                 value = transformed.parse().unwrap();
                             }
@@ -913,10 +1023,16 @@ async fn proxy_handler(
                 (MixSource::Header(src), MixTarget::BodyField(dst)) => {
                     if let Some(mut value) = get_header_val(&mut headers_map, &m.action, src) {
                         if let Some(trans) = trans_s.clone() {
-                            let dst_val: Option<String> = get_bodymap_val(&mut json_map, &MixAction::Copy, &dst)
-                                .map_or(None, |v| Some(v.as_str().unwrap().to_string()));
-                            if let Some(transformed) =
-                            apply_transformations(&trans,&value.to_str().unwrap(), dst_val.as_deref(), Some(&query_map)).await
+                            let dst_val: Option<String> =
+                                get_bodymap_val(&mut json_map, &MixAction::Copy, &dst)
+                                    .map_or(None, |v| Some(v.as_str().unwrap().to_string()));
+                            if let Some(transformed) = apply_transformations(
+                                &trans,
+                                &value.to_str().unwrap(),
+                                dst_val.as_deref(),
+                                Some(&query_map),
+                            )
+                            .await
                             {
                                 value = transformed.parse().unwrap();
                             }
@@ -934,19 +1050,38 @@ async fn proxy_handler(
                     let value_opt = get_header_val(&mut headers_map, &m.action, src);
                     event!(Level::DEBUG, ">>> get_header_val returned: {:?}", value_opt);
                     if let Some(mut value) = value_opt {
-                        event!(Level::DEBUG, ">>> value before trans: {}", value.to_str().unwrap_or_default());
+                        event!(
+                            Level::DEBUG,
+                            ">>> value before trans: {}",
+                            value.to_str().unwrap_or_default()
+                        );
                         if let Some(trans) = trans_s.clone() {
-                            let dst_val: Option<String> = get_querymap_val(&mut query_map, &MixAction::Copy, &dst)
-                                .map_or(None, |v| Some(v.join(",")));
-                            if let Some(transformed) =
-                            apply_transformations(&trans, &value.to_str().unwrap(), dst_val.as_deref(), Some(&query_map)).await
+                            let dst_val: Option<String> =
+                                get_querymap_val(&mut query_map, &MixAction::Copy, &dst)
+                                    .map_or(None, |v| Some(v.join(",")));
+                            if let Some(transformed) = apply_transformations(
+                                &trans,
+                                &value.to_str().unwrap(),
+                                dst_val.as_deref(),
+                                Some(&query_map),
+                            )
+                            .await
                             {
                                 value = transformed.parse().unwrap();
-                                event!(Level::DEBUG, ">>> value after trans: {}", value.to_str().unwrap_or_default());
+                                event!(
+                                    Level::DEBUG,
+                                    ">>> value after trans: {}",
+                                    value.to_str().unwrap_or_default()
+                                );
                             }
                         }
                         let obj = Box::leak(Box::new(dst));
-                        event!(Level::DEBUG, ">>> inserting into query_map: {} -> {}", obj.to_string(), value.to_str().unwrap_or_default());
+                        event!(
+                            Level::DEBUG,
+                            ">>> inserting into query_map: {} -> {}",
+                            obj.to_string(),
+                            value.to_str().unwrap_or_default()
+                        );
                         query_map.insert(
                             obj.to_string(),
                             vec![value.clone().to_str().unwrap().to_string()],
@@ -961,15 +1096,28 @@ async fn proxy_handler(
                         if let Some(cache_key) = query_map.get(key_field).and_then(|v| v.first()) {
                             if let Some(cached) = USER_CACHE.get(cache_key) {
                                 if let Some(value_str) = cached.as_str() {
-                                    event!(Level::DEBUG, ">>> CacheHeader found: {} -> {}", cache_key, value_str);
+                                    event!(
+                                        Level::DEBUG,
+                                        ">>> CacheHeader found: {} -> {}",
+                                        cache_key,
+                                        value_str
+                                    );
                                     let obj = Box::leak(Box::new(dst));
                                     query_map.insert(obj.to_string(), vec![value_str.to_string()]);
                                 }
                             } else {
-                                event!(Level::WARN, ">>> CacheHeader key {} not found in cache", cache_key);
+                                event!(
+                                    Level::WARN,
+                                    ">>> CacheHeader key {} not found in cache",
+                                    cache_key
+                                );
                             }
                         } else {
-                            event!(Level::WARN, ">>> CacheHeader key_field {} not found in query", key_field);
+                            event!(
+                                Level::WARN,
+                                ">>> CacheHeader key_field {} not found in query",
+                                key_field
+                            );
                         }
                     }
                 }
@@ -981,7 +1129,12 @@ async fn proxy_handler(
                         if let Some(cache_key) = query_map.get(key_field).and_then(|v| v.first()) {
                             if let Some(cached) = USER_CACHE.get(cache_key) {
                                 if let Some(value_str) = cached.as_str() {
-                                    event!(Level::DEBUG, ">>> CacheHeader found: {} -> {}", cache_key, value_str);
+                                    event!(
+                                        Level::DEBUG,
+                                        ">>> CacheHeader found: {} -> {}",
+                                        cache_key,
+                                        value_str
+                                    );
                                     let header_value: HeaderValue = value_str.parse().unwrap();
                                     let obj = Box::leak(Box::new(dst));
                                     headers_map.insert(obj.as_str(), header_value);
@@ -998,9 +1151,17 @@ async fn proxy_handler(
                         if let Some(cache_key) = query_map.get(key_field).and_then(|v| v.first()) {
                             if let Some(cached) = USER_CACHE.get(cache_key) {
                                 if let Some(value_str) = cached.as_str() {
-                                    event!(Level::DEBUG, ">>> CacheHeader found: {} -> {}", cache_key, value_str);
+                                    event!(
+                                        Level::DEBUG,
+                                        ">>> CacheHeader found: {} -> {}",
+                                        cache_key,
+                                        value_str
+                                    );
                                     let obj = Box::leak(Box::new(dst));
-                                    json_map.insert(obj.to_string(), Value::String(value_str.to_string()));
+                                    json_map.insert(
+                                        obj.to_string(),
+                                        Value::String(value_str.to_string()),
+                                    );
                                 }
                             }
                         }
@@ -1014,39 +1175,56 @@ async fn proxy_handler(
                             // AddTarget 直接使用指定的值，不依赖 source
                             event!(Level::DEBUG, ">>> AddTarget with value: {}", value);
                             Some(vec![value.clone()])
-                        },
-                        _ => get_querymap_val(&mut query_map, &m.action, src)
+                        }
+                        _ => get_querymap_val(&mut query_map, &m.action, src),
                     };
                     event!(Level::DEBUG, ">>> value_opt resolved to: {:?}", value_opt);
                     if let Some(mut value) = value_opt {
                         event!(Level::DEBUG, ">>> value before trans: {}", value.join(","));
                         if let Some(trans) = trans_s.clone() {
-                            let dst_val: Option<String> = get_querymap_val(&mut query_map, &MixAction::Copy, &dst)
-                                .map_or(None, |v| Some(v.join(",")));
-                            if let Some(transformed) =
-                            apply_transformations(&trans, &value.join(",").as_str(),dst_val.as_deref(), Some(&query_map)).await
+                            let dst_val: Option<String> =
+                                get_querymap_val(&mut query_map, &MixAction::Copy, &dst)
+                                    .map_or(None, |v| Some(v.join(",")));
+                            if let Some(transformed) = apply_transformations(
+                                &trans,
+                                &value.join(",").as_str(),
+                                dst_val.as_deref(),
+                                Some(&query_map),
+                            )
+                            .await
                             {
-                                let v:String = transformed.parse().unwrap();
-                                value = vec!(v.split(",").collect());
+                                let v: String = transformed.parse().unwrap();
+                                value = vec![v.split(",").collect()];
                                 event!(Level::DEBUG, ">>> value after trans: {}", value.join(","));
                             }
                         }
                         let obj = Box::leak(Box::new(dst));
-                        event!(Level::DEBUG, ">>> inserting into query_map: {} -> {}", obj.to_string(), value.join(","));
+                        event!(
+                            Level::DEBUG,
+                            ">>> inserting into query_map: {} -> {}",
+                            obj.to_string(),
+                            value.join(",")
+                        );
                         query_map.insert(obj.to_string(), value);
                     }
                 }
                 // Query to Header
                 (MixSource::Query(src), MixTarget::Header(dst)) => {
-                    if let Some(mut value) = get_querymap_val(&mut query_map, &m.action, src){
+                    if let Some(mut value) = get_querymap_val(&mut query_map, &m.action, src) {
                         if let Some(trans) = trans_s.clone() {
-                            let dst_val: Option<String> = get_header_val(&mut headers_map, &MixAction::Copy, &dst)
-                                .map_or(None, |v| Some(v.to_str().unwrap().to_string()));
-                            if let Some(transformed) =
-                            apply_transformations(&trans, &value.join(",").as_str(), dst_val.as_deref(), Some(&query_map)).await
+                            let dst_val: Option<String> =
+                                get_header_val(&mut headers_map, &MixAction::Copy, &dst)
+                                    .map_or(None, |v| Some(v.to_str().unwrap().to_string()));
+                            if let Some(transformed) = apply_transformations(
+                                &trans,
+                                &value.join(",").as_str(),
+                                dst_val.as_deref(),
+                                Some(&query_map),
+                            )
+                            .await
                             {
-                                let v:String = transformed.parse().unwrap();
-                                value = vec!(v.split(",").collect());
+                                let v: String = transformed.parse().unwrap();
+                                value = vec![v.split(",").collect()];
                             }
                         }
                         let obj = Box::leak(Box::new(dst));
@@ -1061,31 +1239,41 @@ async fn proxy_handler(
                     let query_str = query_map_to_sorted_string(&query_map);
                     let mut value = query_str.clone();
                     if let Some(trans) = trans_s.clone() {
-                        let dst_val: Option<String> = get_header_val(&mut headers_map, &MixAction::Copy, &dst)
-                            .map_or(None, |v| Some(v.to_str().unwrap().to_string()));
-                        if let Some(transformed) =
-                        apply_transformations(&trans, &query_str, dst_val.as_deref(), Some(&query_map)).await
+                        let dst_val: Option<String> =
+                            get_header_val(&mut headers_map, &MixAction::Copy, &dst)
+                                .map_or(None, |v| Some(v.to_str().unwrap().to_string()));
+                        if let Some(transformed) = apply_transformations(
+                            &trans,
+                            &query_str,
+                            dst_val.as_deref(),
+                            Some(&query_map),
+                        )
+                        .await
                         {
                             value = transformed;
                         }
                     }
                     let obj = Box::leak(Box::new(dst));
-                    headers_map.insert(
-                        obj.as_str(),
-                        HeaderValue::from_str(value.as_str()).unwrap(),
-                    );
+                    headers_map
+                        .insert(obj.as_str(), HeaderValue::from_str(value.as_str()).unwrap());
                 }
                 // Query to Body
                 (MixSource::Query(src), MixTarget::BodyField(dst)) => {
-                    if let Some(mut value) = get_querymap_val(&mut query_map, &m.action, src){
+                    if let Some(mut value) = get_querymap_val(&mut query_map, &m.action, src) {
                         if let Some(trans) = trans_s.clone() {
-                            let dst_val: Option<String> = get_bodymap_val(&mut json_map, &MixAction::Copy, &dst)
-                                .map_or(None, |v| Some(v.as_str().unwrap().to_string()));
-                            if let Some(transformed) =
-                            apply_transformations(&trans, &value.join(",").as_str(),dst_val.as_deref(), Some(&query_map)).await
+                            let dst_val: Option<String> =
+                                get_bodymap_val(&mut json_map, &MixAction::Copy, &dst)
+                                    .map_or(None, |v| Some(v.as_str().unwrap().to_string()));
+                            if let Some(transformed) = apply_transformations(
+                                &trans,
+                                &value.join(",").as_str(),
+                                dst_val.as_deref(),
+                                Some(&query_map),
+                            )
+                            .await
                             {
-                                let v:String = transformed.parse().unwrap();
-                                value = vec!(v.split(",").collect());
+                                let v: String = transformed.parse().unwrap();
+                                value = vec![v.split(",").collect()];
                             }
                         }
                         let obj = Box::leak(Box::new(dst));
@@ -1100,7 +1288,7 @@ async fn proxy_handler(
                     match &m.action {
                         MixAction::Move => {
                             for (k, v) in res_json.iter() {
-                                let src_key = format!("{}.{}",src,k);
+                                let src_key = format!("{}.{}", src, k);
                                 json_map.remove(src_key.as_str()); // delete source
                                 json_map.remove(k.as_str()); // delete source
                                 json_map.insert(k.clone().replace(src, dst.as_str()), v.clone());
@@ -1120,7 +1308,9 @@ async fn proxy_handler(
                             }
                         }
                         // CacheSet/CacheGet 不在 request body->body 处理
-                        MixAction::CacheSet | MixAction::CacheGet | MixAction::CacheHeaderSet(_) => {}
+                        MixAction::CacheSet
+                        | MixAction::CacheGet
+                        | MixAction::CacheHeaderSet(_) => {}
                     };
                 }
                 // Body to Query
@@ -1131,7 +1321,7 @@ async fn proxy_handler(
                     let value = match &m.action {
                         MixAction::Move => {
                             for (k, _) in res_json.iter() {
-                                let src_key = format!("{}.{}",src,k);
+                                let src_key = format!("{}.{}", src, k);
                                 json_map.remove(src_key.as_str()); // delete source
                                 json_map.remove(k.as_str());
                             }
@@ -1146,7 +1336,9 @@ async fn proxy_handler(
                             None
                         }
                         // CacheSet/CacheGet 不在 request body->query 处理
-                        MixAction::CacheSet | MixAction::CacheGet | MixAction::CacheHeaderSet(_) => None,
+                        MixAction::CacheSet
+                        | MixAction::CacheGet
+                        | MixAction::CacheHeaderSet(_) => None,
                     };
                     if let Some(value) = value {
                         let obj = Box::leak(Box::new(dst));
@@ -1154,8 +1346,8 @@ async fn proxy_handler(
                     }
                 }
                 // AllQueries to Query/Body - 不支持
-                (MixSource::AllQueries, MixTarget::Query(_)) |
-                (MixSource::AllQueries, MixTarget::BodyField(_)) => {
+                (MixSource::AllQueries, MixTarget::Query(_))
+                | (MixSource::AllQueries, MixTarget::BodyField(_)) => {
                     event!(Level::WARN, "AllQueries source only supports Header target");
                 }
                 // Body to Header
@@ -1166,7 +1358,7 @@ async fn proxy_handler(
                     let value = match &m.action {
                         MixAction::Move => {
                             for (k, _) in res_json.iter() {
-                                let src_key = format!("{}.{}",src,k);
+                                let src_key = format!("{}.{}", src, k);
                                 json_map.remove(src_key.as_str()); // delete source
                                 json_map.remove(k.as_str());
                             }
@@ -1181,7 +1373,9 @@ async fn proxy_handler(
                             None
                         }
                         // CacheSet/CacheGet 不在 request body->header 处理
-                        MixAction::CacheSet | MixAction::CacheGet | MixAction::CacheHeaderSet(_) => None,
+                        MixAction::CacheSet
+                        | MixAction::CacheGet
+                        | MixAction::CacheHeaderSet(_) => None,
                     };
                     if let Some(value) = value {
                         let obj = Box::leak(Box::new(dst));
@@ -1190,11 +1384,20 @@ async fn proxy_handler(
                     }
                 }
             }
-            event!(Level::DEBUG, "<<< mix mapping {}, query_map keys: {:?}", idx, query_map.keys().collect::<Vec<_>>());
+            event!(
+                Level::DEBUG,
+                "<<< mix mapping {}, query_map keys: {:?}",
+                idx,
+                query_map.keys().collect::<Vec<_>>()
+            );
         }
     }
 
-    event!(Level::DEBUG, "All mix mappings done, query_map keys: {:?}", query_map.keys().collect::<Vec<_>>());
+    event!(
+        Level::DEBUG,
+        "All mix mappings done, query_map keys: {:?}",
+        query_map.keys().collect::<Vec<_>>()
+    );
     event!(Level::DEBUG, "final body : {:?}", json_map);
 
     // 目标地址处理 + query参数
@@ -1328,10 +1531,15 @@ async fn proxy_handler(
     }
 
     // 移除压缩编码头
-    if headers_map.contains_key(header::ACCEPT_ENCODING){
+    if headers_map.contains_key(header::ACCEPT_ENCODING) {
         headers_map.remove(header::ACCEPT_ENCODING);
     }
-    event!(Level::INFO, "Sending {} request to {}", &target_method, &target_url);
+    event!(
+        Level::INFO,
+        "Sending {} request to {}",
+        &target_method,
+        &target_url
+    );
     event!(
         Level::DEBUG,
         "Request headers: {:?} | Body size: {}",
@@ -1349,11 +1557,13 @@ async fn proxy_handler(
                 "header" => headers_map
                     .get(src_value)
                     .and_then(|hv| hv.to_str().ok())
-                    .and_then(|s| s.parse().ok()).unwrap(),
+                    .and_then(|s| s.parse().ok())
+                    .unwrap(),
                 "query" => query_map
                     .get(src_value)
                     .map(|values| Value::String(values.join(",")))
-                    .and_then(|v| v.as_bool()).unwrap(),
+                    .and_then(|v| v.as_bool())
+                    .unwrap(),
                 _ => false,
             }
         }
@@ -1367,7 +1577,7 @@ async fn proxy_handler(
         ServiceType::DirectResponse => true,
         _ => false,
     };
-    
+
     event!(Level::DEBUG, "is_direct_response: {:?}", is_direct_response);
 
     // 尝试从缓存获取数据（如果配置了 CacheGet）
@@ -1378,13 +1588,20 @@ async fn proxy_handler(
             for m in &conf.response.mix_mappings {
                 if let MixAction::CacheGet = &m.action {
                     if let Some(key_field) = &m.cache_key_field {
-                        event!(Level::DEBUG, ">>> CacheGet looking for key_field: {}", key_field);
+                        event!(
+                            Level::DEBUG,
+                            ">>> CacheGet looking for key_field: {}",
+                            key_field
+                        );
                         // 尝试从 query_map 中获取 key（经过 request mix mappings 处理后的）
-                        cache_key = query_map.get(key_field)
-                            .and_then(|v| v.first()).map(|s| s.clone());
+                        cache_key = query_map
+                            .get(key_field)
+                            .and_then(|v| v.first())
+                            .map(|s| s.clone());
                         if cache_key.is_none() {
                             // 尝试从 header 中获取 key
-                            cache_key = headers.get(key_field.as_str())
+                            cache_key = headers
+                                .get(key_field.as_str())
                                 .and_then(|v| v.to_str().ok())
                                 .map(|s| s.to_owned());
                         }
@@ -1397,10 +1614,18 @@ async fn proxy_handler(
 
         if let Some(key) = cache_key {
             if let Some(cached_body) = USER_CACHE.get_and_clear(&key) {
-                event!(Level::INFO, "Cache hit for key: {}...", &key[..8.min(key.len())]);
+                event!(
+                    Level::INFO,
+                    "Cache hit for key: {}...",
+                    &key[..8.min(key.len())]
+                );
                 Some(cached_body)
             } else {
-                event!(Level::WARN, "Cache miss for key: {}...", &key[..8.min(key.len())]);
+                event!(
+                    Level::WARN,
+                    "Cache miss for key: {}...",
+                    &key[..8.min(key.len())]
+                );
                 None
             }
         } else {
@@ -1429,22 +1654,27 @@ async fn proxy_handler(
                 if final_json_map.is_empty() {
                     client.unwrap().post(&target_url.clone())
                 } else {
-                    client.unwrap().post(&target_url.clone()).body(converted_body)
+                    client
+                        .unwrap()
+                        .post(&target_url.clone())
+                        .body(converted_body)
                 }
             }
             _ => unreachable!(),
         };
 
-        Some(request_builder
-            .headers(headers_map)
-            .send()
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::BAD_GATEWAY,
-                    format!("Forward request failed: {}", e),
-                )
-            })?)
+        Some(
+            request_builder
+                .headers(headers_map)
+                .send()
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        format!("Forward request failed: {}", e),
+                    )
+                })?,
+        )
     };
 
     // redirect - cache_hit 时跳过 redirect 处理
@@ -1455,11 +1685,7 @@ async fn proxy_handler(
             red_headers_map.extend(location_header.clone());
             let b = Vec::<u8>::new();
             event!(Level::DEBUG, "Redirect Header: {:?}", red_headers_map);
-            return Ok((
-                resp.status(),
-                red_headers_map,
-                axum::body::Bytes::from(b)
-            ).into_response());
+            return Ok((resp.status(), red_headers_map, axum::body::Bytes::from(b)).into_response());
         }
     }
 
@@ -1518,12 +1744,7 @@ async fn proxy_handler(
             }
         };
 
-        return Ok((
-            res_status,
-            res_headers_map,
-            Body::from_stream(stream),
-        )
-            .into_response());
+        return Ok((res_status, res_headers_map, Body::from_stream(stream)).into_response());
     }
 
     // 没有配置response mix_mappings，直接返回response
@@ -1553,17 +1774,25 @@ async fn proxy_handler(
     let res_body = if cache_config.is_some() {
         cache_config.clone().unwrap().to_string().into_bytes()
     } else if let Some(resp) = response.take() {
-        resp.bytes().await.map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Body read failed: {}", e),
-            )
-        })?.to_vec()
+        resp.bytes()
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Body read failed: {}", e),
+                )
+            })?
+            .to_vec()
     } else {
         Vec::new()
     };
 
-    event!(Level::INFO, "Received response {} from {}", res_status, target_url);
+    event!(
+        Level::INFO,
+        "Received response {} from {}",
+        res_status,
+        target_url
+    );
     event!(
         Level::DEBUG,
         "Response headers: {:?} | Body size: {} bytes",
@@ -1597,8 +1826,8 @@ async fn proxy_handler(
         if res_content_type
             .to_str()
             .unwrap()
-            .starts_with(mime::APPLICATION_JSON.essence_str()) ||
-            res_content_type
+            .starts_with(mime::APPLICATION_JSON.essence_str())
+            || res_content_type
                 .to_str()
                 .unwrap()
                 .starts_with(mime::TEXT_PLAIN.essence_str())
@@ -1629,14 +1858,22 @@ async fn proxy_handler(
             let s = m.source.clone();
             let t = m.target.clone();
             let trans_s = m.transformations.clone();
-            
+
             // 处理 CacheSet 和 CacheHeaderSet（它们不需要 source 和 target）
             match &m.action {
                 MixAction::CacheSet => {
                     // 从 res_json_map 中提取缓存 key，缓存整个响应 JSON
                     if let Some(key_field) = &m.cache_key_field {
-                        event!(Level::DEBUG, ">>> CacheSet looking for key_field: {}", key_field);
-                        event!(Level::DEBUG, ">>> res_json_map keys: {:?}", res_json_map.keys().collect::<Vec<_>>());
+                        event!(
+                            Level::DEBUG,
+                            ">>> CacheSet looking for key_field: {}",
+                            key_field
+                        );
+                        event!(
+                            Level::DEBUG,
+                            ">>> res_json_map keys: {:?}",
+                            res_json_map.keys().collect::<Vec<_>>()
+                        );
                         if let Some(key) = res_json_map.get(key_field) {
                             let key_str = key.as_str().unwrap_or_default().to_string();
                             event!(Level::DEBUG, ">>> CacheSet found key: {}", key_str);
@@ -1655,7 +1892,12 @@ async fn proxy_handler(
                 MixAction::CacheHeaderSet(header_name) => {
                     // 从原始请求 headers 中提取指定 header 并缓存
                     if let Some(key_field) = &m.cache_key_field {
-                        event!(Level::DEBUG, ">>> CacheHeaderSet header: {}, key_field: {}", header_name, key_field);
+                        event!(
+                            Level::DEBUG,
+                            ">>> CacheHeaderSet header: {}, key_field: {}",
+                            header_name,
+                            key_field
+                        );
                         // 从 req_headers 获取要缓存的 header 值
                         if let Some(value) = req_headers.get(header_name) {
                             let value_str = value.to_str().unwrap_or_default().to_string();
@@ -1663,16 +1905,25 @@ async fn proxy_handler(
                             let expires = m.cache_expires_in.unwrap_or(3600);
                             // 使用 key_field 作为缓存 key，缓存 header 值
                             USER_CACHE.set(key_field.clone(), Value::String(value_str), expires);
-                            event!(Level::INFO, "Header {} cached with key {}", header_name, key_field);
+                            event!(
+                                Level::INFO,
+                                "Header {} cached with key {}",
+                                header_name,
+                                key_field
+                            );
                         } else {
-                            event!(Level::WARN, ">>> CacheHeaderSet header {} not found in request", header_name);
+                            event!(
+                                Level::WARN,
+                                ">>> CacheHeaderSet header {} not found in request",
+                                header_name
+                            );
                         }
                     }
                     continue;
                 }
                 _ => {}
             }
-            
+
             if s.is_none() || t.is_none() {
                 continue;
             }
@@ -1687,10 +1938,16 @@ async fn proxy_handler(
                         let value_str = value.join(",");
                         let mut header_value = HeaderValue::from_str(&value_str).unwrap();
                         if let Some(trans) = trans_s.clone() {
-                            let dst_val: Option<String> = get_header_val(&mut res_headers_map, &MixAction::Copy, &dst)
-                                .map_or(None, |v| Some(v.to_str().unwrap().to_string()));
-                            if let Some(transformed) =
-                            apply_transformations(&trans, &value_str, dst_val.as_deref(), Some(&query_map)).await
+                            let dst_val: Option<String> =
+                                get_header_val(&mut res_headers_map, &MixAction::Copy, &dst)
+                                    .map_or(None, |v| Some(v.to_str().unwrap().to_string()));
+                            if let Some(transformed) = apply_transformations(
+                                &trans,
+                                &value_str,
+                                dst_val.as_deref(),
+                                Some(&query_map),
+                            )
+                            .await
                             {
                                 header_value = transformed.parse().unwrap();
                             }
@@ -1705,10 +1962,16 @@ async fn proxy_handler(
                         let value_str = value.join(",");
                         let mut final_value = value_str.clone();
                         if let Some(trans) = trans_s.clone() {
-                            let dst_val: Option<String> = get_bodymap_val(&mut res_json_map, &MixAction::Copy, &dst)
-                                .map_or(None, |v| Some(v.as_str().unwrap().to_string()));
-                            if let Some(transformed) =
-                            apply_transformations(&trans, &value_str, dst_val.as_deref(), Some(&query_map)).await
+                            let dst_val: Option<String> =
+                                get_bodymap_val(&mut res_json_map, &MixAction::Copy, &dst)
+                                    .map_or(None, |v| Some(v.as_str().unwrap().to_string()));
+                            if let Some(transformed) = apply_transformations(
+                                &trans,
+                                &value_str,
+                                dst_val.as_deref(),
+                                Some(&query_map),
+                            )
+                            .await
                             {
                                 final_value = transformed;
                             }
@@ -1723,10 +1986,16 @@ async fn proxy_handler(
                         let value_str = value.join(",");
                         let mut final_value = value.clone();
                         if let Some(trans) = trans_s.clone() {
-                            let dst_val: Option<String> = get_querymap_val(&mut query_map, &MixAction::Copy, &dst)
-                                .map_or(None, |v| Some(v.join(",")));
-                            if let Some(transformed) =
-                            apply_transformations(&trans, &value_str, dst_val.as_deref(), Some(&query_map)).await
+                            let dst_val: Option<String> =
+                                get_querymap_val(&mut query_map, &MixAction::Copy, &dst)
+                                    .map_or(None, |v| Some(v.join(",")));
+                            if let Some(transformed) = apply_transformations(
+                                &trans,
+                                &value_str,
+                                dst_val.as_deref(),
+                                Some(&query_map),
+                            )
+                            .await
                             {
                                 final_value = vec![transformed];
                             }
@@ -1741,10 +2010,16 @@ async fn proxy_handler(
                         let value_str = value.to_str().unwrap_or_default().to_string();
                         let mut header_value = value.clone();
                         if let Some(trans) = trans_s.clone() {
-                            let dst_val: Option<String> = get_header_val(&mut res_headers_map, &MixAction::Copy, &dst)
-                                .map_or(None, |v| Some(v.to_str().unwrap().to_string()));
-                            if let Some(transformed) =
-                            apply_transformations(&trans, &value_str, dst_val.as_deref(), Some(&query_map)).await
+                            let dst_val: Option<String> =
+                                get_header_val(&mut res_headers_map, &MixAction::Copy, &dst)
+                                    .map_or(None, |v| Some(v.to_str().unwrap().to_string()));
+                            if let Some(transformed) = apply_transformations(
+                                &trans,
+                                &value_str,
+                                dst_val.as_deref(),
+                                Some(&query_map),
+                            )
+                            .await
                             {
                                 header_value = transformed.parse().unwrap();
                             }
@@ -1758,10 +2033,16 @@ async fn proxy_handler(
                         let value_str = value.to_str().unwrap_or_default().to_string();
                         let mut final_value = value_str.clone();
                         if let Some(trans) = trans_s.clone() {
-                            let dst_val: Option<String> = get_bodymap_val(&mut res_json_map, &MixAction::Copy, &dst)
-                                .map_or(None, |v| Some(v.as_str().unwrap().to_string()));
-                            if let Some(transformed) =
-                            apply_transformations(&trans, &value_str, dst_val.as_deref(), Some(&query_map)).await
+                            let dst_val: Option<String> =
+                                get_bodymap_val(&mut res_json_map, &MixAction::Copy, &dst)
+                                    .map_or(None, |v| Some(v.as_str().unwrap().to_string()));
+                            if let Some(transformed) = apply_transformations(
+                                &trans,
+                                &value_str,
+                                dst_val.as_deref(),
+                                Some(&query_map),
+                            )
+                            .await
                             {
                                 final_value = transformed;
                             }
@@ -1775,10 +2056,16 @@ async fn proxy_handler(
                         let value_str = value.to_str().unwrap_or_default().to_string();
                         let mut final_value = vec![value_str.clone()];
                         if let Some(trans) = trans_s.clone() {
-                            let dst_val: Option<String> = get_querymap_val(&mut query_map, &MixAction::Copy, &dst)
-                                .map_or(None, |v| Some(v.join(",")));
-                            if let Some(transformed) =
-                            apply_transformations(&trans, &value_str, dst_val.as_deref(), Some(&query_map)).await
+                            let dst_val: Option<String> =
+                                get_querymap_val(&mut query_map, &MixAction::Copy, &dst)
+                                    .map_or(None, |v| Some(v.join(",")));
+                            if let Some(transformed) = apply_transformations(
+                                &trans,
+                                &value_str,
+                                dst_val.as_deref(),
+                                Some(&query_map),
+                            )
+                            .await
                             {
                                 final_value = vec![transformed];
                             }
@@ -1791,30 +2078,55 @@ async fn proxy_handler(
                 (MixSource::CacheHeader, MixTarget::Header(dst)) => {
                     // 从 req_query_map 中获取 key_field 对应的值作为缓存 key
                     if let Some(key_field) = &m.cache_key_field {
-                        if let Some(cache_key) = req_query_map.get(key_field).and_then(|v| v.first()) {
+                        if let Some(cache_key) =
+                            req_query_map.get(key_field).and_then(|v| v.first())
+                        {
                             if let Some(cached) = USER_CACHE.get(cache_key) {
                                 if let Some(value_str) = cached.as_str() {
-                                    event!(Level::DEBUG, ">>> CacheHeader {} found: {}", cache_key, value_str);
+                                    event!(
+                                        Level::DEBUG,
+                                        ">>> CacheHeader {} found: {}",
+                                        cache_key,
+                                        value_str
+                                    );
                                     let header_value: HeaderValue = value_str.parse().unwrap();
                                     let obj = Box::leak(Box::new(dst));
                                     res_headers_map.insert(obj.as_str(), header_value);
                                 }
                             } else {
-                                event!(Level::WARN, ">>> CacheHeader key {} not found in cache", cache_key);
+                                event!(
+                                    Level::WARN,
+                                    ">>> CacheHeader key {} not found in cache",
+                                    cache_key
+                                );
                             }
                         } else {
-                            event!(Level::WARN, ">>> CacheHeader key_field {} not found in req_query", key_field);
+                            event!(
+                                Level::WARN,
+                                ">>> CacheHeader key_field {} not found in req_query",
+                                key_field
+                            );
                         }
                     }
                 }
                 (MixSource::CacheHeader, MixTarget::BodyField(dst)) => {
                     if let Some(key_field) = &m.cache_key_field {
-                        if let Some(cache_key) = req_query_map.get(key_field).and_then(|v| v.first()) {
+                        if let Some(cache_key) =
+                            req_query_map.get(key_field).and_then(|v| v.first())
+                        {
                             if let Some(cached) = USER_CACHE.get(cache_key) {
                                 if let Some(value_str) = cached.as_str() {
-                                    event!(Level::DEBUG, ">>> CacheHeader {} found: {}", cache_key, value_str);
+                                    event!(
+                                        Level::DEBUG,
+                                        ">>> CacheHeader {} found: {}",
+                                        cache_key,
+                                        value_str
+                                    );
                                     let obj = Box::leak(Box::new(dst));
-                                    res_json_map.insert(obj.to_string(), Value::String(value_str.to_string()));
+                                    res_json_map.insert(
+                                        obj.to_string(),
+                                        Value::String(value_str.to_string()),
+                                    );
                                 }
                             }
                         }
@@ -1822,10 +2134,17 @@ async fn proxy_handler(
                 }
                 (MixSource::CacheHeader, MixTarget::Query(dst)) => {
                     if let Some(key_field) = &m.cache_key_field {
-                        if let Some(cache_key) = req_query_map.get(key_field).and_then(|v| v.first()) {
+                        if let Some(cache_key) =
+                            req_query_map.get(key_field).and_then(|v| v.first())
+                        {
                             if let Some(cached) = USER_CACHE.get(cache_key) {
                                 if let Some(value_str) = cached.as_str() {
-                                    event!(Level::DEBUG, ">>> CacheHeader {} found: {}", cache_key, value_str);
+                                    event!(
+                                        Level::DEBUG,
+                                        ">>> CacheHeader {} found: {}",
+                                        cache_key,
+                                        value_str
+                                    );
                                     let obj = Box::leak(Box::new(dst));
                                     query_map.insert(obj.to_string(), vec![value_str.to_string()]);
                                 }
@@ -1837,10 +2156,16 @@ async fn proxy_handler(
                 (MixSource::Header(src), MixTarget::Header(dst)) => {
                     if let Some(mut value) = get_header_val(&mut res_headers_map, &m.action, src) {
                         if let Some(trans) = trans_s.clone() {
-                            let dst_val: Option<String> = get_header_val(&mut res_headers_map, &MixAction::Copy, &dst)
-                                .map_or(None, |v| Some(v.to_str().unwrap().to_string()));
-                            if let Some(transformed) =
-                            apply_transformations(&trans, &value.to_str().unwrap(),dst_val.as_deref(), Some(&query_map)).await
+                            let dst_val: Option<String> =
+                                get_header_val(&mut res_headers_map, &MixAction::Copy, &dst)
+                                    .map_or(None, |v| Some(v.to_str().unwrap().to_string()));
+                            if let Some(transformed) = apply_transformations(
+                                &trans,
+                                &value.to_str().unwrap(),
+                                dst_val.as_deref(),
+                                Some(&query_map),
+                            )
+                            .await
                             {
                                 value = transformed.parse().unwrap();
                             }
@@ -1851,12 +2176,18 @@ async fn proxy_handler(
                 }
                 // Header to Body
                 (MixSource::Header(src), MixTarget::BodyField(dst)) => {
-                    if let Some(mut value) = get_header_val(&mut res_headers_map, &m.action, src){
+                    if let Some(mut value) = get_header_val(&mut res_headers_map, &m.action, src) {
                         if let Some(trans) = trans_s.clone() {
-                            let dst_val: Option<String> = get_bodymap_val(&mut res_json_map, &MixAction::Copy, &dst)
-                                .map_or(None, |v| Some(v.as_str().unwrap().to_string()));
-                            if let Some(transformed) =
-                            apply_transformations(&trans, &value.to_str().unwrap(), dst_val.as_deref(), Some(&query_map)).await
+                            let dst_val: Option<String> =
+                                get_bodymap_val(&mut res_json_map, &MixAction::Copy, &dst)
+                                    .map_or(None, |v| Some(v.as_str().unwrap().to_string()));
+                            if let Some(transformed) = apply_transformations(
+                                &trans,
+                                &value.to_str().unwrap(),
+                                dst_val.as_deref(),
+                                Some(&query_map),
+                            )
+                            .await
                             {
                                 value = transformed.parse().unwrap();
                             }
@@ -1875,7 +2206,7 @@ async fn proxy_handler(
                     match &m.action {
                         MixAction::Move => {
                             for (k, v) in res_json.iter() {
-                                let src_key = format!("{}.{}",src,k);
+                                let src_key = format!("{}.{}", src, k);
                                 res_json_map.remove(src_key.as_str()); // delete source
                                 res_json_map
                                     .insert(k.clone().replace(src, dst.as_str()), v.clone());
@@ -1896,7 +2227,9 @@ async fn proxy_handler(
                             }
                         }
                         // CacheSet/CacheGet 不在此处处理
-                        MixAction::CacheSet | MixAction::CacheGet | MixAction::CacheHeaderSet(_) => {}
+                        MixAction::CacheSet
+                        | MixAction::CacheGet
+                        | MixAction::CacheHeaderSet(_) => {}
                     };
                 }
                 // Body to Header
@@ -1906,7 +2239,7 @@ async fn proxy_handler(
                     let value = match &m.action {
                         MixAction::Move => {
                             for (k, _) in res_json.iter() {
-                                let src_key = format!("{}.{}",src,k);
+                                let src_key = format!("{}.{}", src, k);
                                 res_json_map.remove(src_key.as_str()); // delete source
                                 res_json_map.remove(k.as_str());
                             }
@@ -1921,7 +2254,9 @@ async fn proxy_handler(
                             None
                         }
                         // CacheSet/CacheGet 不在此处处理
-                        MixAction::CacheSet | MixAction::CacheGet | MixAction::CacheHeaderSet(_) => None,
+                        MixAction::CacheSet
+                        | MixAction::CacheGet
+                        | MixAction::CacheHeaderSet(_) => None,
                     };
                     if let Some(value) = value {
                         let obj = Box::leak(Box::new(dst));
@@ -2050,11 +2385,10 @@ async fn main() {
     event!(Level::INFO, "Starting sso_adapter server on port 8080");
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener,app.into_make_service())
+    axum::serve(listener, app.into_make_service())
         .await
         .unwrap();
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -2063,16 +2397,32 @@ mod tests {
 
     #[test]
     fn json_array() {
-        let mut res_json_map = HashMap::<String,Value>::new();
+        let mut res_json_map = HashMap::<String, Value>::new();
         // let john = json!({"entryUUID":"8a6287d4-7c09-ff8f-017c-0bc12adf4c90","sub":"IYANG10","role":["id=VALIDATE,id=FRANCHISE,id=appRole,ou=role,OU=Repository,o=decathlon","id=Global,id=Shoppertrak,id=appRole,ou=role,OU=Repository,o=decathlon","id=UserIT,id=Confluence,id=appRole,ou=role,OU=Repository,o=decathlon","id=COM2U_ContRev,id=COM2U,id=appRole,ou=role,OU=Repository,o=decathlon","id=StrongAuth,id=PingId,id=appRole,ou=role,ou=repository,o=decathlon","id=ACCESS,id=IPAC,id=appRole,ou=role,ou=repository,o=decathlon","id=DECASTORE_national_user,id=DECASTORE,id=appRole,ou=role,OU=Repository,o=decathlon","id=biItTools,id=OBIEE,id=appRole,ou=role,OU=Repository,o=decathlon","id=LECTURE,id=CATALOGUEAGENCEMENT,id=appRole,ou=role,ou=repository,o=decathlon","id=Admin,id=TATTOO,id=appRole,ou=role,OU=Repository,o=decathlon","id=WebApp_chiffres_secu3,id=Webapp_chiffres,id=appRole,ou=role,OU=Repository,o=decathlon","id=WebApp_chiffres_secu1,id=Webapp_chiffres,id=appRole,ou=role,OU=Repository,o=decathlon","id=CRCStoreUser,id=CRC,id=appRole,ou=role,OU=Repository,o=decathlon","id=WebApp_chiffres_secu2,id=Webapp_chiffres,id=appRole,ou=role,OU=Repository,o=decathlon","id=SportLeader,id=MyGame,id=appRole,ou=role,OU=Repository,o=decathlon","id=READER,id=POSDATA,id=appRole,ou=role,OU=Repository,o=decathlon","id=Standard,id=eTCO,id=appRole,ou=role,OU=Repository,o=decathlon","id=access,id=pds,id=appRole,ou=role,ou=repository,o=decathlon","id=User,id=Bird-Office,id=appRole,ou=role,OU=Repository,o=decathlon","id=Read,id=OptiPCB,id=appRole,ou=role,OU=Repository,o=decathlon","id=ACCESS,id=CZ_DECASPACE,id=appRole,ou=role,ou=repository,o=decathlon","id=HON,id=CZ_DECASPACE,id=appRole,ou=role,ou=repository,o=decathlon","id=SFA,id=CZ_DECASPACE,id=appRole,ou=role,ou=repository,o=decathlon","id=ADMIN,id=CZ_DECASPACE,id=appRole,ou=role,ou=repository,o=decathlon","id=ZANTHUS_PROFILE,id=ZANTHUS,id=appRole,ou=role,OU=Repository,o=decathlon","id=IT_ACCESS_DTC,id=DTC_V2,id=appRole,ou=role,OU=Repository,o=decathlon","id=access,id=sptTool,id=appRole,ou=role,ou=repository,o=decathlon","id=ROLE_SUPPORT,id=DKTRENT,id=appRole,ou=role,OU=Repository,o=decathlon","id=QC_VIEWER_ACCESS,id=QUERY_CATALOG_PORTAL,id=appRole,ou=role,OU=Repository,o=decathlon","id=SERVICES,id=WSO,id=appRole,ou=role,OU=Repository,o=decathlon","id=RCOA,id=PSV,id=appRole,ou=role,OU=Repository,o=decathlon","id=PRODUCT_DATA_INTERNATIONAL_WRITER,id=SPID,id=appRole,ou=role,OU=Repository,o=decathlon","id=PRODUCT_DATA_LOCALIZED_WRITER,id=SPID,id=appRole,ou=role,OU=Repository,o=decathlon","id=GITHUB,id=ACCESS,id=appRole,ou=role,OU=Repository,o=decathlon","id=DEFAULT,id=SPORTYCOINS,id=appRole,ou=role,OU=Repository,o=decathlon","id=VIEWER,id=CAT,id=appRole,ou=role,OU=Repository,o=decathlon"],"c":"CN","mail":"irene.yang@decathlon.com","displayName":"YANG Irene","givenName":"Irene","sex":"2","mobile":"+8617312678351","cn":"YANG Irene","sitetype":"HQ","title":"Data Engineer","objectclass":["top","person","organizationalPerson","inetOrgPerson","ocExtendedperson"],"uuid":"8a6287d4-7c09-ff8f-017c-0bc12adf4c90","allsites":"CNHQCHLB","uid":"IYANG10","site":"CNHQCHLB","federation_idp":"d1","hrid":"6101715","familyName":"YANG","sitename":"CHINA LAB","sn":"YANG","costcenter":"005010585017C105","jobname":"DATA.ENG"});
         let john = json!({"role":["aad", {"name":"aa", "sex":"n", "dd": ["ad"]}],"t1":{"ar": 123}});
-        json_to_flat_map(&john, "",&mut res_json_map);
+        json_to_flat_map(&john, "", &mut res_json_map);
         for ele in res_json_map.clone() {
-            print!("{}\n",ele.0)
+            print!("{}\n", ele.0)
         }
         let v = flat_map_to_json(&res_json_map);
         println!("{:?}", v.clone());
         println!("\n{}", v.to_string());
-        assert_eq!(1,1);
+        assert_eq!(1, 1);
+    }
+    #[test]
+    fn response_field_supports_json_pointer_with_array() {
+        let body = r#"{"data":[{"email":"a@b.com"}]}"#;
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            json.pointer("/data/0/email").unwrap().as_str(),
+            Some("a@b.com")
+        );
+    }
+
+    #[test]
+    fn response_field_supports_json_pointer_with_out_array() {
+        let body = r#"{"data":"test"}"#;
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(json.get("data").unwrap().as_str(), Some("test"));
     }
 }
