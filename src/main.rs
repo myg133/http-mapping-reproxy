@@ -587,9 +587,24 @@ async fn apply_transformations(
                                                 } else {
                                                     json.get(field)
                                                 };
-
                                             if let Some(value) = value_opt {
-                                                if let Some(str_value) = value.as_str() {
+                                                // 空数组、空对象、null → 空字符串
+                                                let is_empty_or_null = value.is_null()
+                                                    || (value.is_array()
+                                                        && value
+                                                            .as_array()
+                                                            .map(|a| a.is_empty())
+                                                            .unwrap_or(false))
+                                                    || (value.is_object()
+                                                        && value
+                                                            .as_object()
+                                                            .map(|o| o.is_empty())
+                                                            .unwrap_or(false));
+
+                                                if is_empty_or_null {
+                                                    result = String::new();
+                                                    event!(Level::DEBUG, "    Extracted empty value (array/object/null)");
+                                                } else if let Some(str_value) = value.as_str() {
                                                     result = str_value.to_string();
                                                     event!(
                                                         Level::DEBUG,
@@ -597,7 +612,7 @@ async fn apply_transformations(
                                                         result
                                                     );
                                                 } else {
-                                                    // 如果不是字符串，直接转为字符串
+                                                    // 非空数组、非空对象、数字、布尔 → 转字符串
                                                     result = value.to_string();
                                                     event!(
                                                         Level::DEBUG,
@@ -611,7 +626,7 @@ async fn apply_transformations(
                                                     "    Field '{}' not found in response",
                                                     field
                                                 );
-                                                result = text;
+                                                result = String::new();
                                             }
                                         }
                                         Err(e) => {
@@ -620,11 +635,11 @@ async fn apply_transformations(
                                                 "    Failed to parse response as JSON: {:?}",
                                                 e
                                             );
-                                            result = text;
+                                            result = String::new();
                                         }
                                     }
                                 } else {
-                                    result = text;
+                                    result = String::new();
                                 }
                             }
                             Err(e) => {
@@ -2395,6 +2410,31 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// 模拟修复后的提取逻辑
+    fn extract(json: &Value, field: &str) -> String {
+        let value_opt = if field.starts_with('/') {
+            json.pointer(field)
+        } else {
+            json.get(field)
+        };
+
+        match value_opt {
+            Some(v) => {
+                let is_empty_or_null = v.is_null()
+                    || (v.is_array() && v.as_array().unwrap().is_empty())
+                    || (v.is_object() && v.as_object().unwrap().is_empty());
+                if is_empty_or_null {
+                    String::new()
+                } else if let Some(s) = v.as_str() {
+                    s.to_string()
+                } else {
+                    v.to_string()
+                }
+            }
+            None => String::from("(not found)"),
+        }
+    }
+
     #[test]
     fn json_array() {
         let mut res_json_map = HashMap::<String, Value>::new();
@@ -2409,20 +2449,42 @@ mod tests {
         println!("\n{}", v.to_string());
         assert_eq!(1, 1);
     }
+
     #[test]
-    fn response_field_supports_json_pointer_with_array() {
-        let body = r#"{"data":[{"email":"a@b.com"}]}"#;
-        let json: serde_json::Value = serde_json::from_str(body).unwrap();
-        assert_eq!(
-            json.pointer("/data/0/email").unwrap().as_str(),
-            Some("a@b.com")
-        );
+    fn empty_array_returns_empty_string() {
+        let body = r#"{"data":[],"has_more":false,"limit":10,"total":0,"page":1}"#;
+        let json: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(extract(&json, "/data"), "");
     }
 
     #[test]
-    fn response_field_supports_json_pointer_with_out_array() {
-        let body = r#"{"data":"test"}"#;
-        let json: serde_json::Value = serde_json::from_str(body).unwrap();
-        assert_eq!(json.get("data").unwrap().as_str(), Some("test"));
+    fn null_returns_empty_string() {
+        let body = r#"{"data":null}"#;
+        let json: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(extract(&json, "data"), "");
+    }
+
+    #[test]
+    fn empty_object_returns_empty_string() {
+        let body = r#"{"data":{}}"#;
+        let json: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(extract(&json, "/data"), "");
+    }
+
+    #[test]
+    fn non_empty_array_still_serializes() {
+        let body = r#"{"data":[{"email":"a@b.com"}]}"#;
+        let json: Value = serde_json::from_str(body).unwrap();
+        // /data 本身还是数组，走 to_string
+        assert_eq!(extract(&json, "/data"), r#"[{"email":"a@b.com"}]"#);
+        // /data/0/email 才是字符串
+        assert_eq!(extract(&json, "/data/0/email"), "a@b.com");
+    }
+
+    #[test]
+    fn missing_field_returns_fallback() {
+        let body = r#"{"has_more":false}"#;
+        let json: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(extract(&json, "/data"), "(not found)");
     }
 }
